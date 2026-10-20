@@ -131,7 +131,7 @@ export default function AdminPage() {
 
         {result && (
           <div className="ui-card">
-            <ScheduleResults result={result} />
+            <ScheduleResults result={result} memberNames={group.members.map((m) => m.memberName)} />
           </div>
         )}
       </div>

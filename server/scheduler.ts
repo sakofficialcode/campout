@@ -13,6 +13,12 @@ const MIN_GAP_MINUTES = 30;
 // Someone only relieves a member who's past the cap if they can stay at least
 // this long — otherwise it's a 15-minute in-and-out that just fragments both.
 const MIN_RELIEF_MINUTES = 60;
+// A member this far behind on total hours takes over from whoever's on shift,
+// even short of the cap. Wide enough that two people don't trade back and forth.
+const FAIRNESS_RELIEF_GAP_MINUTES = 120;
+// How long someone past the cap keeps going so a less-loaded member about to
+// free up can relieve them, instead of a stand-in who'd then lock that member out.
+const MAX_OVERTIME_WAIT_MINUTES = 30;
 
 function toDateStr(d: Date): string {
   return (
@@ -83,6 +89,7 @@ export function generateSchedule(
   const minGapSlots = Math.ceil(MIN_GAP_MINUTES / granularity);
   const minGapMinutes = minGapSlots * granularity;
   const minReliefSlots = Math.ceil(MIN_RELIEF_MINUTES / granularity);
+  const maxOvertimeWaitSlots = Math.floor(MAX_OVERTIME_WAIT_MINUTES / granularity);
 
   const start = parseWallClock(config.shiftStart);
   const end = parseWallClock(config.shiftEnd);
@@ -229,20 +236,60 @@ export function generateSchedule(
       newlyStarted.push(...ordered.slice(0, needed));
     }
 
-    // Relief: anyone working past the 3h cap without a break (re-picked at the
-    // cap because nobody else could cover) is checked every slot, and handed
-    // off as soon as a rested member who can stay a while becomes free.
-    const overtime = kept.filter(onLongStreak).sort((a, b) => b.streakSlots - a.streakSlots);
-    if (overtime.length > 0) {
-      const relievers = byPreference(
-        eligible.filter((s) => !newlyStarted.includes(s) && isRested(s) && canCoverRelief(s))
-      );
-      for (const [i, reliever] of relievers.slice(0, overtime.length).entries()) {
-        const relieved = overtime[i];
-        closeShift(relieved);
-        kept = kept.filter((s) => s !== relieved);
-        newlyStarted.push(reliever);
-      }
+    // Relief, checked every slot, by a rested member who can stay a while:
+    //  - anyone working past the 3h cap without a break (re-picked at the cap
+    //    because nobody else could cover) is handed off right away;
+    //  - anyone far ahead on total hours is handed off to someone far behind,
+    //    once they've done a decent stint, so a late-available member isn't
+    //    shut out just because the people on shift never hit the cap.
+    const loadNow = (s: MemberState) => s.totalMinutesWorked + s.slotsElapsed * granularity;
+    const relievers = byPreference(
+      eligible.filter((s) => !newlyStarted.includes(s) && isRested(s) && canCoverRelief(s))
+    );
+    // Hold off on a swap if someone with even fewer hours frees up shortly —
+    // otherwise the stand-in's own minimum stint would lock that person out
+    // (e.g. a 3.5h member subbing in 15 min before a 0h member becomes free).
+    // A fairness swap isn't urgent and can wait up to the relief stint; a break
+    // for someone past the cap waits only briefly.
+    const lessLoadedArrivesSoon = (reliever: MemberState, withinSlots: number) =>
+      [...states.values()].some((q) => {
+        if (q === reliever || q.openStart !== null || newlyStarted.includes(q)) return false;
+        if (loadNow(q) >= loadNow(reliever)) return false;
+        const availability = availabilityByName.get(q.memberName)!;
+        for (let k = 1; k <= withinSlots; k++) {
+          const later = addMinutes(slotStart, k * granularity);
+          if (later >= end) return false;
+          if (
+            getStatus(availability, slotKey(later)) === 'available' &&
+            (q.cooldownUntil === null || q.cooldownUntil <= later) &&
+            workableAheadCount(q.memberName, later) >= minReliefSlots
+          ) {
+            return true;
+          }
+        }
+        return false;
+      });
+
+    for (const reliever of relievers) {
+      const relievable = kept
+        .filter(
+          (s) =>
+            onLongStreak(s) ||
+            (!isNight &&
+              isPreferred(reliever) &&
+              s.slotsElapsed >= minReliefSlots &&
+              loadNow(s) - loadNow(reliever) >= FAIRNESS_RELIEF_GAP_MINUTES)
+        )
+        .sort(
+          (a, b) =>
+            Number(onLongStreak(b)) - Number(onLongStreak(a)) || b.streakSlots - a.streakSlots || loadNow(b) - loadNow(a)
+        );
+      if (relievable.length === 0) continue;
+      const relieved = relievable[0];
+      if (lessLoadedArrivesSoon(reliever, onLongStreak(relieved) ? maxOvertimeWaitSlots : minReliefSlots - 1)) continue;
+      closeShift(relieved);
+      kept = kept.filter((s) => s !== relieved);
+      newlyStarted.push(reliever);
     }
 
     for (const state of kept) {

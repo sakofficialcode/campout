@@ -225,9 +225,12 @@ interface Props {
   result: ScheduleResult;
   interactive?: InteractiveConfig;
   previewRequest?: SwapRequest | null;
+  // Everyone who submitted availability, so members given no shifts still
+  // count (as 0h) in the workload stats instead of silently dropping out.
+  memberNames?: string[];
 }
 
-export default function ScheduleResults({ result, interactive, previewRequest }: Props) {
+export default function ScheduleResults({ result, interactive, previewRequest, memberNames }: Props) {
   const [weekOffset, setWeekOffset] = useState(0);
   const [selections, setSelections] = useState<Partial<Record<SelectionSlot, RangeSelection>>>({});
   const [proposal, setProposal] = useState<ProposalState>(EMPTY_PROPOSAL);
@@ -307,7 +310,9 @@ export default function ScheduleResults({ result, interactive, previewRequest }:
   }, [result.assignments, result.understaffed]);
 
   const workload = useMemo(() => {
-    const byMember = new Map<string, { minutes: number; shiftCount: number }>();
+    const byMember = new Map<string, { minutes: number; shiftCount: number }>(
+      (memberNames ?? []).map((name) => [name, { minutes: 0, shiftCount: 0 }])
+    );
     for (const a of result.assignments) {
       const minutes = (new Date(a.end).getTime() - new Date(a.start).getTime()) / 60_000;
       const entry = byMember.get(a.memberName) ?? { minutes: 0, shiftCount: 0 };
@@ -318,7 +323,7 @@ export default function ScheduleResults({ result, interactive, previewRequest }:
     return [...byMember.entries()]
       .map(([name, stats]) => ({ name, ...stats }))
       .sort((a, b) => b.minutes - a.minutes);
-  }, [result.assignments]);
+  }, [result.assignments, memberNames]);
 
   const targetMinutes = workload.length
     ? workload.reduce((sum, w) => sum + w.minutes, 0) / workload.length
@@ -509,11 +514,15 @@ export default function ScheduleResults({ result, interactive, previewRequest }:
             </div>
             <div className="rounded-md border border-gray-200 bg-white px-4 py-3">
               <p className="text-xs text-gray-500">Most scheduled</p>
-              <p className="text-lg font-semibold text-gray-900">{formatHours(maxWorkload.minutes)}</p>
+              <p className="text-lg font-semibold text-gray-900">
+                {formatHours(maxWorkload.minutes)} <span className="text-xs font-normal text-gray-500">{maxWorkload.name}</span>
+              </p>
             </div>
             <div className="rounded-md border border-gray-200 bg-white px-4 py-3">
               <p className="text-xs text-gray-500">Least scheduled</p>
-              <p className="text-lg font-semibold text-gray-900">{formatHours(minWorkload.minutes)}</p>
+              <p className="text-lg font-semibold text-gray-900">
+                {formatHours(minWorkload.minutes)} <span className="text-xs font-normal text-gray-500">{minWorkload.name}</span>
+              </p>
             </div>
           </div>
         </div>

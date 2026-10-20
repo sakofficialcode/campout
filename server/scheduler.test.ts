@@ -348,6 +348,76 @@ test('overtime relief: at the cap itself, a short-stint member does not hop in f
   assert.deepEqual(byName('Bob'), []);
 });
 
+test('fairness relief: someone far behind on hours takes over even before the on-shift member hits the cap', () => {
+  // 7h window, 15-min slots, 1 required. Alice works 00-03, Carol covers her
+  // break 03-04, Alice is back at 04:00 — a fresh shift, nowhere near the cap.
+  // Bob only frees up at 05:00 with 0h worked vs Alice's 4h, so he should take
+  // over then rather than Alice running on to the end.
+  const config = baseConfig({
+    shiftStart: '2026-01-01T00:00',
+    shiftEnd: '2026-01-01T07:00',
+    stdOnShift: 1,
+    timeGranularity: 15,
+  });
+  const onlyBetween = (from: number, to: number) => {
+    const availability: Record<string, 'unavailable'> = {};
+    for (let m = 0; m < 7 * 60; m += 15) {
+      if (m < from || m >= to) availability[`2026-01-01-${m}`] = 'unavailable';
+    }
+    return availability;
+  };
+  const result = generateSchedule(config, [
+    { memberName: 'Alice', availability: {} },
+    { memberName: 'Bob', availability: onlyBetween(5 * 60, 7 * 60) },
+    { memberName: 'Carol', availability: onlyBetween(3 * 60, 4 * 60) },
+  ]);
+  const byName = (name: string) =>
+    result.assignments.filter((a) => a.memberName === name).map((a) => [a.start, a.end]);
+
+  assert.deepEqual(byName('Alice'), [
+    [utc('2026-01-01T00:00'), utc('2026-01-01T03:00')],
+    [utc('2026-01-01T04:00'), utc('2026-01-01T05:00')],
+  ]);
+  assert.deepEqual(byName('Carol'), [[utc('2026-01-01T03:00'), utc('2026-01-01T04:00')]]);
+  assert.deepEqual(byName('Bob'), [[utc('2026-01-01T05:00'), utc('2026-01-01T07:00')]]);
+  assert.equal(result.understaffed.length, 0);
+});
+
+test('fairness relief waits briefly for someone with fewer hours instead of locking them out', () => {
+  // Alice is on from 04:00 with 4h worked. At 05:00 Bob (1h) could relieve
+  // her, but Dan (0h) frees up at 05:15. Subbing Bob in would shield him for
+  // his first hour and lock Dan out — so Alice holds 15 more minutes and Dan
+  // takes over directly.
+  const config = baseConfig({
+    shiftStart: '2026-01-01T00:00',
+    shiftEnd: '2026-01-01T07:00',
+    stdOnShift: 1,
+    timeGranularity: 15,
+  });
+  const onlyBetween = (...ranges: Array<[number, number]>) => {
+    const availability: Record<string, 'unavailable'> = {};
+    for (let m = 0; m < 7 * 60; m += 15) {
+      if (!ranges.some(([from, to]) => m >= from && m < to)) availability[`2026-01-01-${m}`] = 'unavailable';
+    }
+    return availability;
+  };
+  const result = generateSchedule(config, [
+    { memberName: 'Alice', availability: {} },
+    { memberName: 'Bob', availability: onlyBetween([3 * 60, 4 * 60], [5 * 60, 7 * 60]) },
+    { memberName: 'Dan', availability: onlyBetween([5 * 60 + 15, 7 * 60]) },
+  ]);
+  const byName = (name: string) =>
+    result.assignments.filter((a) => a.memberName === name).map((a) => [a.start, a.end]);
+
+  assert.deepEqual(byName('Alice'), [
+    [utc('2026-01-01T00:00'), utc('2026-01-01T03:00')],
+    [utc('2026-01-01T04:00'), utc('2026-01-01T05:15')],
+  ]);
+  assert.deepEqual(byName('Bob'), [[utc('2026-01-01T03:00'), utc('2026-01-01T04:00')]]);
+  assert.deepEqual(byName('Dan'), [[utc('2026-01-01T05:15'), utc('2026-01-01T07:00')]]);
+  assert.equal(result.understaffed.length, 0);
+});
+
 test('night-window wraparound classification (22 -> 6)', () => {
   const hour = (h: number) => new Date(Date.UTC(2026, 0, 1, h, 0));
   assert.equal(isNightSlot(hour(23), 22, 6), true);
