@@ -2,7 +2,8 @@ import { useMemo, useRef, useState } from 'react';
 import type { ScheduleResult, SwapRequest, UnderstaffedRange } from '../lib/types';
 import { getMemberColor, UNDERSTAFFED_COLOR } from '../lib/colors';
 
-const HOUR_HEIGHT_PX = 48;
+// Tall enough that a single 15-minute slot (20px) still fits a one-line label.
+const HOUR_HEIGHT_PX = 80;
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 // `generatedAt` is a real instant, so it renders in the viewer's local
@@ -36,6 +37,18 @@ function formatTimeOfDay(minutes: number): string {
   const period = h >= 12 ? 'PM' : 'AM';
   const displayHour = h % 12 || 12;
   return m === 0 ? `${displayHour} ${period}` : `${displayHour}:${m.toString().padStart(2, '0')} ${period}`;
+}
+
+// "2:00 – 2:30 PM", or "11:45 AM – 1:45 PM" when the range crosses noon/midnight.
+function formatTimeRange(startMin: number, endMin: number): string {
+  const clock = (minutes: number) => {
+    const h = Math.floor(minutes / 60) % 24;
+    return `${h % 12 || 12}:${(minutes % 60).toString().padStart(2, '0')}`;
+  };
+  const period = (minutes: number) => (Math.floor(minutes / 60) % 24 >= 12 ? 'PM' : 'AM');
+  return period(startMin) === period(endMin)
+    ? `${clock(startMin)} – ${clock(endMin)} ${period(endMin)}`
+    : `${clock(startMin)} ${period(startMin)} – ${clock(endMin)} ${period(endMin)}`;
 }
 
 // Day boundaries and calendar keys read UTC too — local getters would shift
@@ -679,6 +692,13 @@ export default function ScheduleResults({ result, interactive, previewRequest }:
                           style={{ top: `${pctTop(m)}%` }}
                         />
                       ))}
+                      {hourMarks.slice(0, -1).map((m) => (
+                        <div
+                          key={`half-${m}`}
+                          className="absolute left-0 right-0 border-t border-dashed border-gray-100"
+                          style={{ top: `${pctTop(m + 30)}%` }}
+                        />
+                      ))}
 
                       {gaps.map((gap, idx) => (
                         <div
@@ -711,26 +731,35 @@ export default function ScheduleResults({ result, interactive, previewRequest }:
                           for (let m = seg.startMin; m < seg.endMin; m += snapMinutes) cellMinutes.push(m);
                         }
 
+                        const timeRange = formatTimeRange(seg.startMin, seg.endMin);
+                        // Exact-length blocks (no minimum height) so a short shift never
+                        // spills over the next one; short ones put the times on one line.
+                        const blockHeightPx = ((seg.endMin - seg.startMin) / 60) * HOUR_HEIGHT_PX;
+                        const twoLine = blockHeightPx >= 36;
+
                         return (
                           <div key={seg.key}>
                             <div
-                              title={`${seg.memberName}: ${formatTimeOfDay(seg.startMin)} – ${formatTimeOfDay(seg.endMin)}`}
-                              className={`absolute rounded-md px-1.5 py-0.5 overflow-hidden shadow-sm${draggable ? ' cursor-crosshair' : ''}`}
+                              title={`${seg.memberName}: ${timeRange}`}
+                              className={`absolute rounded-md px-1.5 overflow-hidden shadow-sm${twoLine ? ' py-1' : ' flex items-center'}${draggable ? ' cursor-crosshair' : ''}`}
                               style={{
-                                top: `${pctTop(seg.startMin)}%`,
-                                height: `${Math.max(pctHeight(seg.startMin, seg.endMin), 4)}%`,
+                                top: `calc(${pctTop(seg.startMin)}% + 1px)`,
+                                height: `calc(${pctHeight(seg.startMin, seg.endMin)}% - 2px)`,
                                 left,
                                 width,
                                 backgroundColor: color,
-                                minHeight: '18px',
                               }}
                             >
-                              <div className="flex items-center gap-1 text-[10px] font-medium text-white leading-tight">
+                              <div className="flex min-w-0 items-center gap-1 text-[11px] font-medium text-white leading-tight">
                                 <span className="inline-flex h-3.5 w-3.5 shrink-0 items-center justify-center rounded-full bg-white/25 text-[8px]">
                                   {initials(seg.memberName)}
                                 </span>
                                 <span className="truncate">{seg.memberName}</span>
+                                {!twoLine && <span className="truncate font-normal text-white/90">{timeRange}</span>}
                               </div>
+                              {twoLine && (
+                                <div className="truncate text-[10px] text-white/90 leading-tight mt-0.5">{timeRange}</div>
+                              )}
                             </div>
 
                             {cellMinutes.map((m) => {

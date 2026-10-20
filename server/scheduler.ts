@@ -10,6 +10,9 @@ import type {
 
 const MAX_SHIFT_MINUTES = 3 * 60;
 const MIN_GAP_MINUTES = 30;
+// Someone only relieves a member who's past the cap if they can stay at least
+// this long — otherwise it's a 15-minute in-and-out that just fragments both.
+const MIN_RELIEF_MINUTES = 60;
 
 function toDateStr(d: Date): string {
   return (
@@ -66,6 +69,9 @@ interface MemberState {
   lastSlotEnd: Date | null;
   cooldownUntil: Date | null; // null = never worked yet, i.e. always eligible
   totalMinutesWorked: number; // for fairness: least-loaded-first when starting new shifts
+  // Consecutive slots on duty without a break, spanning back-to-back shifts —
+  // the 3h cap splits assignments, but someone re-picked at the cap keeps going.
+  streakSlots: number;
 }
 
 export function generateSchedule(
@@ -76,6 +82,7 @@ export function generateSchedule(
   const maxSlotsPerShift = Math.floor(MAX_SHIFT_MINUTES / granularity);
   const minGapSlots = Math.ceil(MIN_GAP_MINUTES / granularity);
   const minGapMinutes = minGapSlots * granularity;
+  const minReliefSlots = Math.ceil(MIN_RELIEF_MINUTES / granularity);
 
   const start = parseWallClock(config.shiftStart);
   const end = parseWallClock(config.shiftEnd);
@@ -90,6 +97,7 @@ export function generateSchedule(
         lastSlotEnd: null,
         cooldownUntil: null,
         totalMinutesWorked: 0,
+        streakSlots: 0,
       },
     ])
   );
@@ -172,42 +180,69 @@ export function generateSchedule(
       }
     }
 
+    // Least-worked-so-far first, so hours even out however shift lengths vary.
+    const byLoad = (a: MemberState, b: MemberState) => {
+      if (a.totalMinutesWorked !== b.totalMinutesWorked) return a.totalMinutesWorked - b.totalMinutesWorked;
+      // Equally loaded — prefer whoever can carry the shift furthest.
+      const aAhead = workableAheadCount(a.memberName, slotStart);
+      const bAhead = workableAheadCount(b.memberName, slotStart);
+      if (aAhead !== bAhead) return bAhead - aAhead;
+      const at = a.cooldownUntil ? a.cooldownUntil.getTime() : -Infinity;
+      const bt = b.cooldownUntil ? b.cooldownUntil.getTime() : -Infinity;
+      if (at !== bt) return at - bt;
+      return a.memberName.localeCompare(b.memberName);
+    };
+
+    const isPreferred = (s: MemberState) => statusByName.get(s.memberName) === 'available';
+
+    const byPreference = (pool: MemberState[]) => {
+      const preferred = pool.filter(isPreferred).sort(byLoad);
+      const notPreferred = pool.filter((s) => !isPreferred(s)).sort(byLoad);
+      return [...preferred, ...notPreferred];
+    };
+
+    const isRested = (s: MemberState) => s.cooldownUntil === null || s.cooldownUntil <= slotStart;
+    // Already worked a full shift's worth without a break and would keep going.
+    const onLongStreak = (s: MemberState) => !isNight && s.streakSlots >= maxSlotsPerShift;
+    const canCoverRelief = (s: MemberState) => workableAheadCount(s.memberName, slotStart) >= minReliefSlots;
+
+    const eligible = [...states.values()].filter(
+      (s) => s.openStart === null && workableNames.has(s.memberName) && !kept.includes(s)
+    );
+
     const needed = required - kept.length;
-    let newlyStarted: MemberState[] = [];
+    const newlyStarted: MemberState[] = [];
     if (needed > 0) {
-      const eligible = [...states.values()].filter(
-        (s) => s.openStart === null && workableNames.has(s.memberName) && !kept.includes(s)
-      );
-
-      // Least-worked-so-far first, so hours even out however shift lengths vary.
-      const byLoad = (a: MemberState, b: MemberState) => {
-        if (a.totalMinutesWorked !== b.totalMinutesWorked) return a.totalMinutesWorked - b.totalMinutesWorked;
-        // Equally loaded — prefer whoever can carry the shift furthest.
-        const aAhead = workableAheadCount(a.memberName, slotStart);
-        const bAhead = workableAheadCount(b.memberName, slotStart);
-        if (aAhead !== bAhead) return bAhead - aAhead;
-        const at = a.cooldownUntil ? a.cooldownUntil.getTime() : -Infinity;
-        const bt = b.cooldownUntil ? b.cooldownUntil.getTime() : -Infinity;
-        if (at !== bt) return at - bt;
-        return a.memberName.localeCompare(b.memberName);
-      };
-
-      const isPreferred = (s: MemberState) => statusByName.get(s.memberName) === 'available';
-
-      const byPreference = (pool: MemberState[]) => {
-        const preferred = pool.filter(isPreferred).sort(byLoad);
-        const notPreferred = pool.filter((s) => !isPreferred(s)).sort(byLoad);
-        return [...preferred, ...notPreferred];
-      };
-
       // Rest is the dominant axis, preference only a tiebreak within it: a
       // rested not-preferred member is tried before a preferred one still owed
       // rest. Otherwise someone marked not-preferred for a window could be
       // frozen out entirely by an "available" member cycling through cooldown.
-      const rested = eligible.filter((s) => s.cooldownUntil === null || s.cooldownUntil <= slotStart);
-      const resting = eligible.filter((s) => s.cooldownUntil !== null && s.cooldownUntil > slotStart);
+      let ordered = [...byPreference(eligible.filter(isRested)), ...byPreference(eligible.filter((s) => !isRested(s)))];
 
-      newlyStarted = [...byPreference(rested), ...byPreference(resting)].slice(0, needed);
+      // Someone who just hit the cap with no break yet would carry on; only
+      // swap them out for someone who can stay a while, not hop in and out.
+      if (eligible.some(onLongStreak)) {
+        const tooShort = (s: MemberState) => !onLongStreak(s) && !canCoverRelief(s);
+        ordered = [...ordered.filter((s) => !tooShort(s)), ...ordered.filter(tooShort)];
+      }
+
+      newlyStarted.push(...ordered.slice(0, needed));
+    }
+
+    // Relief: anyone working past the 3h cap without a break (re-picked at the
+    // cap because nobody else could cover) is checked every slot, and handed
+    // off as soon as a rested member who can stay a while becomes free.
+    const overtime = kept.filter(onLongStreak).sort((a, b) => b.streakSlots - a.streakSlots);
+    if (overtime.length > 0) {
+      const relievers = byPreference(
+        eligible.filter((s) => !newlyStarted.includes(s) && isRested(s) && canCoverRelief(s))
+      );
+      for (const [i, reliever] of relievers.slice(0, overtime.length).entries()) {
+        const relieved = overtime[i];
+        closeShift(relieved);
+        kept = kept.filter((s) => s !== relieved);
+        newlyStarted.push(reliever);
+      }
     }
 
     for (const state of kept) {
@@ -218,6 +253,9 @@ export function generateSchedule(
       state.openStart = slotStart;
       state.slotsElapsed = 1;
       state.lastSlotEnd = slotEnd;
+    }
+    for (const state of states.values()) {
+      state.streakSlots = kept.includes(state) || newlyStarted.includes(state) ? state.streakSlots + 1 : 0;
     }
 
     const filled = kept.length + newlyStarted.length;

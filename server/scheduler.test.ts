@@ -290,6 +290,64 @@ test('shift-start tiebreak: equally-loaded candidate who can stay longer is pref
   assert.equal(result.understaffed.length, 0);
 });
 
+// 6h window, 15-min slots, 1 required. Alice is available throughout; Bob's
+// availability is just the [from, to) window given, in minutes since midnight.
+function overtimeScenario(bobFrom: number, bobTo: number) {
+  const config = baseConfig({
+    shiftStart: '2026-01-01T00:00',
+    shiftEnd: '2026-01-01T06:00',
+    stdOnShift: 1,
+    timeGranularity: 15,
+  });
+  const bob: Record<string, 'unavailable'> = {};
+  for (let m = 0; m < 6 * 60; m += 15) {
+    if (m < bobFrom || m >= bobTo) bob[`2026-01-01-${m}`] = 'unavailable';
+  }
+  const result = generateSchedule(config, [
+    { memberName: 'Alice', availability: {} },
+    { memberName: 'Bob', availability: bob },
+  ]);
+  const byName = (name: string) =>
+    result.assignments.filter((a) => a.memberName === name).map((a) => [a.start, a.end]);
+  return { result, byName };
+}
+
+test('overtime relief: someone past the 3h cap is relieved mid-shift once a rested member can stay a while', () => {
+  // Bob only frees up at 04:00, an hour into Alice's overtime. He should take
+  // over right then rather than waiting for Alice's next 3h block to run out.
+  const { result, byName } = overtimeScenario(4 * 60, 6 * 60);
+
+  assert.deepEqual(byName('Alice'), [
+    [utc('2026-01-01T00:00'), utc('2026-01-01T03:00')],
+    [utc('2026-01-01T03:00'), utc('2026-01-01T04:00')],
+  ]);
+  assert.deepEqual(byName('Bob'), [[utc('2026-01-01T04:00'), utc('2026-01-01T06:00')]]);
+  assert.equal(result.understaffed.length, 0);
+});
+
+test('overtime relief: no in-and-out swap when the reliever could only cover a short stint', () => {
+  // Bob is free for just 30 min during Alice's overtime — not worth breaking her shift.
+  const { byName } = overtimeScenario(4 * 60, 4 * 60 + 30);
+
+  assert.deepEqual(byName('Alice'), [
+    [utc('2026-01-01T00:00'), utc('2026-01-01T03:00')],
+    [utc('2026-01-01T03:00'), utc('2026-01-01T06:00')],
+  ]);
+  assert.deepEqual(byName('Bob'), []);
+});
+
+test('overtime relief: at the cap itself, a short-stint member does not hop in for 15 minutes', () => {
+  // Bob is free 03:00-03:15 only — exactly when Alice hits the cap. Rather than
+  // Bob for one slot and Alice straight back, Alice carries on.
+  const { byName } = overtimeScenario(3 * 60, 3 * 60 + 15);
+
+  assert.deepEqual(byName('Alice'), [
+    [utc('2026-01-01T00:00'), utc('2026-01-01T03:00')],
+    [utc('2026-01-01T03:00'), utc('2026-01-01T06:00')],
+  ]);
+  assert.deepEqual(byName('Bob'), []);
+});
+
 test('night-window wraparound classification (22 -> 6)', () => {
   const hour = (h: number) => new Date(Date.UTC(2026, 0, 1, h, 0));
   assert.equal(isNightSlot(hour(23), 22, 6), true);
