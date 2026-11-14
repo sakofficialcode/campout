@@ -2,6 +2,7 @@ import { useState, useRef, useMemo, useEffect } from 'react';
 import { ChevronLeft, ChevronRight } from 'lucide-react';
 import 'gapi-script';
 import type { AvailabilityMap, AvailabilityStatus } from '../lib/types';
+import { coverageLabel, formatClockHour, isCoveredHour, type Coverage } from '../lib/coverage';
 
 const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID;
 const GOOGLE_API_KEY = import.meta.env.VITE_GOOGLE_API_KEY;
@@ -20,6 +21,9 @@ type WeekSchedulerProps = {
   nightShifts?: boolean;
   nightShiftStart?: number | null;
   nightShiftEnd?: number | null;
+  // Daily window the group is scheduled in; both null = around the clock.
+  coverageStart?: number | null;
+  coverageEnd?: number | null;
 };
 
 function getStatus(availability: AvailabilityMap, key: string): AvailabilityStatus {
@@ -108,7 +112,14 @@ export default function WeekScheduler({
   nightShifts = false,
   nightShiftStart = null,
   nightShiftEnd = null,
+  coverageStart = null,
+  coverageEnd = null,
 }: WeekSchedulerProps) {
+  const coverage: Coverage | null =
+    coverageStart != null && coverageEnd != null ? { start: coverageStart, end: coverageEnd } : null;
+  const isCoveredMinute = (minutes: number) => isCoveredHour(Math.floor(minutes / 60), coverage);
+  // Keys look like "YYYY-MM-DD-<minuteOfDay>".
+  const isCoveredKey = (key: string) => isCoveredMinute(Number(key.slice(key.lastIndexOf('-') + 1)));
   const [availability, setAvailability] = useState<AvailabilityMap>(initialAvailability);
   const [isDragging, setIsDragging] = useState(false);
   const [paintMode, setPaintMode] = useState<AvailabilityStatus>('unavailable');
@@ -309,7 +320,7 @@ export default function WeekScheduler({
     const start = new Date(startDateTime);
     const end = new Date(endDateTime);
 
-    return cellStart >= start && cellEnd <= end;
+    return cellStart >= start && cellEnd <= end && isCoveredMinute(minutes);
   };
 
   const getCellKey = (dateStr: string, minutes: number) => `${dateStr}-${minutes}`;
@@ -327,13 +338,15 @@ export default function WeekScheduler({
     const map = new Map<number, number[]>();
 
     timeSlots.forEach((minutes) => {
+      if (!isCoveredMinute(minutes)) return;
       const hour = Math.floor(minutes / 60);
       if (!map.has(hour)) map.set(hour, []);
       map.get(hour)!.push(minutes);
     });
 
     return map;
-  }, [timeSlots]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- coverage is derived from the two props below
+  }, [timeSlots, coverageStart, coverageEnd]);
 
   const updateAvailability = (newAvailability: AvailabilityMap) => {
     setAvailability(newAvailability);
@@ -344,7 +357,7 @@ export default function WeekScheduler({
 
   const paintCell = (dateStr: string, minutes: number) => {
     if (nightShifts && nightShiftStart != null && nightShiftEnd != null && isNightHour(minutes / 60, nightShiftStart, nightShiftEnd)) {
-      const keys = nightBlockKeys(dateStr, minutes, nightShiftStart, nightShiftEnd, slotMinutes);
+      const keys = nightBlockKeys(dateStr, minutes, nightShiftStart, nightShiftEnd, slotMinutes).filter(isCoveredKey);
       const updates: AvailabilityMap = {};
       for (const k of keys) updates[k] = paintMode;
       updateAvailability({ ...availability, ...updates });
@@ -380,7 +393,8 @@ export default function WeekScheduler({
   const getStatusCounts = () => {
     let notPreferred = 0;
     let unavailable = 0;
-    for (const status of Object.values(availability)) {
+    for (const [key, status] of Object.entries(availability)) {
+      if (!isCoveredKey(key)) continue;
       if (status === 'not_preferred') notPreferred += 1;
       else if (status === 'unavailable') unavailable += 1;
     }
@@ -417,6 +431,7 @@ export default function WeekScheduler({
     let csv = 'Time,' + allDays.map((d) => `${d.name} (${d.dateStr})`).join(',') + '\n';
 
     timeSlots.forEach((minutes) => {
+      if (!isCoveredMinute(minutes)) return;
       const row = [formatTime(minutes)];
 
       allDays.forEach((day) => {
@@ -524,8 +539,24 @@ export default function WeekScheduler({
               </tr>
             </thead>
             <tbody>
-              {Array.from(groupedSlots.entries()).map(([hour, slots]) =>
-                slots.map((minutes, idx) => (
+              {Array.from(groupedSlots.entries()).map(([hour, slots], groupIdx, groups) => {
+                // An overnight window hides a block in the middle of the day;
+                // mark it so the jump from e.g. 7 AM to 6 PM isn't confusing.
+                const prevHour = groupIdx > 0 ? groups[groupIdx - 1][0] : null;
+                const gap =
+                  prevHour !== null && hour > prevHour + 1 ? (
+                    <tr key={`gap-${hour}`}>
+                      <td
+                        colSpan={daysToDisplay.length + 1}
+                        className="border border-gray-200 bg-gray-50 px-3 py-1.5 text-center text-xs text-gray-500"
+                      >
+                        {formatClockHour(prevHour + 1)} – {formatClockHour(hour)} · not scheduled
+                      </td>
+                    </tr>
+                  ) : null;
+                return [
+                  gap,
+                  ...slots.map((minutes, idx) => (
                   <tr key={`${hour}-${minutes}`}>
                     {idx === 0 && (
                       <td
@@ -556,8 +587,9 @@ export default function WeekScheduler({
                       );
                     })}
                   </tr>
-                ))
-              )}
+                  )),
+                ];
+              })}
             </tbody>
           </table>
         </div>
@@ -572,6 +604,11 @@ export default function WeekScheduler({
           {!readOnly && <li>• Pick a paint mode above, then click and drag on cells to mark them</li>}
           {!readOnly && nightShifts && (
             <li>• Night hours are all-or-nothing: clicking any cell in the night window marks the whole night at once</li>
+          )}
+          {coverage && (
+            <li>
+              • Only the group's scheduled hours ({coverageLabel(coverage)}) are shown — nobody is put on shift outside them
+            </li>
           )}
           <li>• Gray cells are outside the specified time range</li>
           <li>• Green = available, Amber = not preferred, Red = unavailable</li>

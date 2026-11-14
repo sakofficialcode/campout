@@ -17,9 +17,12 @@ import {
   getSwapRequest,
   getSwapRequestsForMember,
   memberExists,
+  removeMember,
   saveMemberAvailability,
   saveSchedule,
   setSwapRequestStatus,
+  updateGroupCoverage,
+  updateGroupSize,
   verifyMemberPassword,
 } from './db.ts';
 import type { CreateGroupPayload, ScheduleResult } from './types.ts';
@@ -193,4 +196,79 @@ test('race #2: two concurrent accepts on the same swap request resolve to exactl
 
   const final = await getSwapRequest(uuid, swap.id);
   assert.equal(final?.status, 'accepted');
+});
+
+test('a full group rejects new members but still lets existing ones update', async () => {
+  const uuid = await createGroup(testGroupPayload({ numMembers: 2 }));
+  await saveMemberAvailability(uuid, 'Alice', 'pw', {});
+  await saveMemberAvailability(uuid, 'Bob', 'pw', {});
+
+  const third = await saveMemberAvailability(uuid, 'Carol', 'pw', {});
+  assert.deepEqual(third, { status: 'group_full', numMembers: 2 });
+  assert.equal(await memberExists(uuid, 'Carol'), false);
+
+  const update = await saveMemberAvailability(uuid, 'Alice', 'pw', { slot: 'available' });
+  assert.equal(update.status, 'ok');
+});
+
+test('concurrent joins for the last spot admit exactly one', async () => {
+  const uuid = await createGroup(testGroupPayload({ numMembers: 1 }));
+  const results = await Promise.all(
+    ['A', 'B', 'C', 'D'].map((name) => saveMemberAvailability(uuid, name, 'pw', {}))
+  );
+  assert.equal(results.filter((r) => r.status === 'ok').length, 1);
+  assert.equal(results.filter((r) => r.status === 'group_full').length, 3);
+  assert.equal((await getMemberSummaries(uuid)).length, 1);
+});
+
+test('updateGroupSize grows freely but cannot shrink below the member count', async () => {
+  const uuid = await createGroup(testGroupPayload({ numMembers: 2 }));
+  await saveMemberAvailability(uuid, 'Alice', 'pw', {});
+  await saveMemberAvailability(uuid, 'Bob', 'pw', {});
+
+  assert.deepEqual(await updateGroupSize(uuid, 1), { status: 'below_member_count', memberCount: 2 });
+  assert.deepEqual(await updateGroupSize(uuid, 3), { status: 'ok', numMembers: 3 });
+  assert.equal((await saveMemberAvailability(uuid, 'Carol', 'pw', {})).status, 'ok');
+  assert.deepEqual(await updateGroupSize(uuid, 2), { status: 'below_member_count', memberCount: 3 });
+  assert.deepEqual(await updateGroupSize('no-such-group', 5), { status: 'not_found' });
+});
+
+test('removeMember frees a spot and clears their pending swap requests', async () => {
+  const uuid = await createGroup(testGroupPayload({ numMembers: 2 }));
+  await saveMemberAvailability(uuid, 'Alice', 'pw', {});
+  await saveMemberAvailability(uuid, 'Bob', 'pw', {});
+  const swap = await createSwapRequest(uuid, {
+    fromMember: 'Alice',
+    toMember: 'Bob',
+    fromStart: '2026-01-01T00:00:00.000Z',
+    fromEnd: '2026-01-01T01:00:00.000Z',
+    toStart: null,
+    toEnd: null,
+    message: null,
+  });
+
+  assert.equal(await removeMember(uuid, 'Bob'), true);
+  assert.equal(await removeMember(uuid, 'Bob'), false);
+  assert.equal(await getSwapRequest(uuid, swap.id), undefined);
+
+  assert.deepEqual(await updateGroupSize(uuid, 1), { status: 'ok', numMembers: 1 });
+  assert.equal((await saveMemberAvailability(uuid, 'Carol', 'pw', {})).status, 'group_full');
+});
+
+test('coverage hours round-trip through create and updateGroupCoverage', async () => {
+  const uuid = await createGroup(testGroupPayload({ coverageStart: 18, coverageEnd: 8 }));
+  let group = await getGroup(uuid);
+  assert.equal(group?.coverageStart, 18);
+  assert.equal(group?.coverageEnd, 8);
+  assert.equal(group?.coverageUpdatedAt, null);
+
+  assert.equal(await updateGroupCoverage(uuid, null, null), true);
+  group = await getGroup(uuid);
+  assert.equal(group?.coverageStart, null);
+  assert.equal(group?.coverageEnd, null);
+  assert.ok(group?.coverageUpdatedAt);
+
+  const aroundTheClock = await getGroup(await createGroup(testGroupPayload()));
+  assert.equal(aroundTheClock?.coverageStart, null);
+  assert.equal(await updateGroupCoverage('no-such-group', 9, 17), false);
 });

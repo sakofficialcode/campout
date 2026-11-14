@@ -35,6 +35,9 @@ interface GroupRow {
   night_shift_start: number | null;
   night_shift_end: number | null;
   night_on_shift: number | null;
+  coverage_start: number | null;
+  coverage_end: number | null;
+  coverage_updated_at: string | null;
   admin_password_hash: string | null;
 }
 
@@ -51,6 +54,9 @@ function rowToConfig(row: GroupRow): GroupConfig {
     nightShiftStart: row.night_shift_start,
     nightShiftEnd: row.night_shift_end,
     nightOnShift: row.night_on_shift,
+    coverageStart: row.coverage_start,
+    coverageEnd: row.coverage_end,
+    coverageUpdatedAt: row.coverage_updated_at,
   };
 }
 
@@ -62,8 +68,8 @@ export async function createGroup(payload: CreateGroupPayload): Promise<string> 
     `INSERT INTO groups (
       id, group_name, num_members, shift_start, shift_end, std_on_shift,
       time_granularity, night_shifts, night_shift_start, night_shift_end,
-      night_on_shift, admin_password_hash, created_at
-    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+      night_on_shift, admin_password_hash, created_at, coverage_start, coverage_end
+    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
     [
       uuid,
       payload.groupName,
@@ -78,6 +84,8 @@ export async function createGroup(payload: CreateGroupPayload): Promise<string> 
       payload.nightShifts ? payload.nightOnShift ?? null : null,
       adminPasswordHash,
       new Date().toISOString(),
+      payload.coverageStart ?? null,
+      payload.coverageEnd ?? null,
     ]
   );
 
@@ -149,7 +157,24 @@ export async function authenticateMember(groupId: string, memberName: string, pa
 
 export type SaveMemberResult =
   | { status: 'ok'; updatedAt: string; created: boolean }
-  | { status: 'invalid_password' };
+  | { status: 'invalid_password' }
+  | { status: 'group_full'; numMembers: number };
+
+// Joining, resizing, and removing members all take this row lock first, so
+// the member count and num_members can't change underneath each other (two
+// people grabbing the last spot at once, or a shrink racing a join).
+async function lockGroupSize(client: pg.PoolClient, groupId: string): Promise<{ numMembers: number; memberCount: number } | undefined> {
+  const group = await client.query<{ num_members: number }>(
+    'SELECT num_members FROM groups WHERE id = $1 FOR UPDATE',
+    [groupId]
+  );
+  if (group.rowCount === 0) return undefined;
+  const count = await client.query<{ count: string }>(
+    'SELECT COUNT(*) AS count FROM members WHERE group_id = $1',
+    [groupId]
+  );
+  return { numMembers: group.rows[0].num_members, memberCount: Number(count.rows[0].count) };
+}
 
 export async function saveMemberAvailability(
   groupId: string,
@@ -162,26 +187,41 @@ export async function saveMemberAvailability(
   try {
     await client.query('BEGIN');
 
-    // Race two concurrent first-time submissions on the UNIQUE index: the
-    // loser gets zero rows back (not a thrown constraint violation) and falls
-    // through to the existing-member path below.
-    const inserted = await client.query(
-      `INSERT INTO members (group_id, member_name, availability, password_hash, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $5)
-       ON CONFLICT (group_id, member_name) DO NOTHING
-       RETURNING updated_at`,
-      [groupId, memberName, JSON.stringify(availability), hashPassword(password), now]
-    );
+    const selectExisting = () =>
+      client.query<{ password_hash: string }>(
+        'SELECT password_hash FROM members WHERE group_id = $1 AND member_name = $2 FOR UPDATE',
+        [groupId, memberName]
+      );
 
-    if (inserted.rowCount === 1) {
-      await client.query('COMMIT');
-      return { status: 'ok', updatedAt: now, created: true };
+    let existing = await selectExisting();
+
+    if (existing.rowCount === 0) {
+      const size = await lockGroupSize(client, groupId);
+      if (size && size.memberCount >= size.numMembers) {
+        await client.query('ROLLBACK');
+        return { status: 'group_full', numMembers: size.numMembers };
+      }
+
+      // A concurrent first-time submission under the same name can still win
+      // the UNIQUE index between our SELECT and INSERT: the loser gets zero
+      // rows back (not a thrown constraint violation) and falls through to the
+      // existing-member path below.
+      const inserted = await client.query(
+        `INSERT INTO members (group_id, member_name, availability, password_hash, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $5)
+         ON CONFLICT (group_id, member_name) DO NOTHING
+         RETURNING updated_at`,
+        [groupId, memberName, JSON.stringify(availability), hashPassword(password), now]
+      );
+
+      if (inserted.rowCount === 1) {
+        await client.query('COMMIT');
+        return { status: 'ok', updatedAt: now, created: true };
+      }
+
+      existing = await selectExisting();
     }
 
-    const existing = await client.query<{ password_hash: string }>(
-      'SELECT password_hash FROM members WHERE group_id = $1 AND member_name = $2 FOR UPDATE',
-      [groupId, memberName]
-    );
     const passwordHash = existing.rows[0]?.password_hash ?? '';
 
     if (!verifyPassword(password, passwordHash)) {
@@ -195,6 +235,80 @@ export async function saveMemberAvailability(
     );
     await client.query('COMMIT');
     return { status: 'ok', updatedAt: now, created: false };
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+// Both null = around the clock. Stamping coverage_updated_at lets the group
+// page tell members who submitted before a change to review their hours.
+export async function updateGroupCoverage(
+  groupId: string,
+  coverageStart: number | null,
+  coverageEnd: number | null
+): Promise<boolean> {
+  const result = await pool.query(
+    'UPDATE groups SET coverage_start = $1, coverage_end = $2, coverage_updated_at = $3 WHERE id = $4',
+    [coverageStart, coverageEnd, new Date().toISOString(), groupId]
+  );
+  return result.rowCount === 1;
+}
+
+export type UpdateGroupSizeResult =
+  | { status: 'ok'; numMembers: number }
+  | { status: 'not_found' }
+  | { status: 'below_member_count'; memberCount: number };
+
+export async function updateGroupSize(groupId: string, numMembers: number): Promise<UpdateGroupSizeResult> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const size = await lockGroupSize(client, groupId);
+    if (!size) {
+      await client.query('ROLLBACK');
+      return { status: 'not_found' };
+    }
+    if (numMembers < size.memberCount) {
+      await client.query('ROLLBACK');
+      return { status: 'below_member_count', memberCount: size.memberCount };
+    }
+    await client.query('UPDATE groups SET num_members = $1 WHERE id = $2', [numMembers, groupId]);
+    await client.query('COMMIT');
+    return { status: 'ok', numMembers };
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+// Deletes the member and any still-pending swap requests involving them
+// (accepted/declined ones stay as history). An already-generated schedule is
+// left untouched — the admin regenerates to drop them from it.
+export async function removeMember(groupId: string, memberName: string): Promise<boolean> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await lockGroupSize(client, groupId);
+    const deleted = await client.query('DELETE FROM members WHERE group_id = $1 AND member_name = $2', [
+      groupId,
+      memberName,
+    ]);
+    if (deleted.rowCount === 0) {
+      await client.query('ROLLBACK');
+      return false;
+    }
+    await client.query(
+      `DELETE FROM swap_requests
+       WHERE group_id = $1 AND status = 'pending' AND (from_member = $2 OR to_member = $2)`,
+      [groupId, memberName]
+    );
+    await client.query('COMMIT');
+    return true;
   } catch (err) {
     await client.query('ROLLBACK');
     throw err;

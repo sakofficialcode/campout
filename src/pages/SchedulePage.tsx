@@ -3,6 +3,7 @@ import { Link, useParams } from 'react-router-dom';
 import ScheduleResults from '../components/ScheduleResults';
 import type { InteractiveConfig } from '../components/ScheduleResults';
 import SwapRequestsPanel from '../components/SwapRequestsPanel';
+import { coverageFromGroup } from '../lib/coverage';
 import { ApiError, createSwapRequest, getGroup, listSwapRequests, viewScheduleAsMember } from '../lib/api';
 import type { GroupConfig, ScheduleResult, SwapRequest } from '../lib/types';
 
@@ -173,7 +174,12 @@ export default function SchedulePage() {
           <>
             <div className="ui-card">
               {result ? (
-                <ScheduleResults result={result} interactive={interactive} previewRequest={previewRequest} />
+                <ScheduleResults
+                  result={result}
+                  interactive={interactive}
+                  previewRequest={previewRequest}
+                  coverage={coverageFromGroup(group)}
+                />
               ) : (
                 <p className="text-sm text-gray-500">No schedule has been generated yet.</p>
               )}

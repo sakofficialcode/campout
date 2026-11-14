@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { generateSchedule, isNightSlot } from './scheduler.ts';
+import { generateSchedule, isCoveredSlot, isNightSlot } from './scheduler.ts';
 import type { GroupConfig, MemberAvailability } from './types.ts';
 
 // Expected timestamps must be built the way scheduler.ts parses them (as UTC),
@@ -22,6 +22,9 @@ function baseConfig(overrides: Partial<GroupConfig>): GroupConfig {
     nightShiftStart: null,
     nightShiftEnd: null,
     nightOnShift: null,
+    coverageStart: null,
+    coverageEnd: null,
+    coverageUpdatedAt: null,
     ...overrides,
   };
 }
@@ -423,4 +426,130 @@ test('night-window wraparound classification (22 -> 6)', () => {
   assert.equal(isNightSlot(hour(23), 22, 6), true);
   assert.equal(isNightSlot(hour(2), 22, 6), true);
   assert.equal(isNightSlot(hour(12), 22, 6), false);
+});
+
+test('isCoveredSlot: null = always, same-day and past-midnight windows', () => {
+  const at = (h: number) => new Date(Date.UTC(2026, 0, 1, h));
+  assert.equal(isCoveredSlot(at(3), { coverageStart: null, coverageEnd: null }), true);
+  assert.equal(isCoveredSlot(at(9), { coverageStart: 9, coverageEnd: 17 }), true);
+  assert.equal(isCoveredSlot(at(17), { coverageStart: 9, coverageEnd: 17 }), false);
+  assert.equal(isCoveredSlot(at(8), { coverageStart: 9, coverageEnd: 17 }), false);
+  assert.equal(isCoveredSlot(at(23), { coverageStart: 18, coverageEnd: 8 }), true);
+  assert.equal(isCoveredSlot(at(7), { coverageStart: 18, coverageEnd: 8 }), true);
+  assert.equal(isCoveredSlot(at(12), { coverageStart: 18, coverageEnd: 8 }), false);
+});
+
+function assertAllInside(
+  result: ReturnType<typeof generateSchedule>,
+  covered: (hour: number) => boolean
+) {
+  const hourMs = 60 * 60_000;
+  for (const range of [...result.assignments, ...result.understaffed]) {
+    for (let t = new Date(range.start).getTime(); t < new Date(range.end).getTime(); t += hourMs) {
+      assert.ok(covered(new Date(t).getUTCHours()), `${range.start}-${range.end} runs into uncovered hour`);
+    }
+  }
+}
+
+test('daily 9-17 coverage: nothing scheduled or understaffed outside the window, every day', () => {
+  const config = baseConfig({
+    shiftStart: '2026-01-01T00:00',
+    shiftEnd: '2026-01-03T00:00',
+    coverageStart: 9,
+    coverageEnd: 17,
+    numMembers: 3,
+  });
+  const members: MemberAvailability[] = ['A', 'B', 'C'].map((memberName) => ({ memberName, availability: {} }));
+
+  const result = generateSchedule(config, members);
+
+  assertAllInside(result, (h) => h >= 9 && h < 17);
+  assert.equal(result.understaffed.length, 0);
+  const hoursScheduled = result.assignments.reduce(
+    (sum, a) => sum + (new Date(a.end).getTime() - new Date(a.start).getTime()) / 3_600_000,
+    0
+  );
+  assert.equal(hoursScheduled, 16); // 8h x 2 days at 1 per shift
+});
+
+test('overnight 18-08 coverage wraps midnight and leaves the daytime empty', () => {
+  const config = baseConfig({
+    shiftStart: '2026-01-01T12:00',
+    shiftEnd: '2026-01-02T12:00',
+    coverageStart: 18,
+    coverageEnd: 8,
+    numMembers: 5,
+  });
+  const members: MemberAvailability[] = ['A', 'B', 'C', 'D', 'E'].map((memberName) => ({ memberName, availability: {} }));
+
+  const result = generateSchedule(config, members);
+
+  assertAllInside(result, (h) => h >= 18 || h < 8);
+  assert.equal(result.understaffed.length, 0);
+  assert.equal(result.assignments[0].start, utc('2026-01-01T18:00'));
+  assert.equal(result.assignments.at(-1)!.end, utc('2026-01-02T08:00'));
+});
+
+test('shifts end at the coverage edge and the off-hours count as rest', () => {
+  // Alice is the only member; with 2h windows on two days she works 2h, goes
+  // home, and is back the next day with no overtime carried over.
+  const config = baseConfig({
+    shiftStart: '2026-01-01T00:00',
+    shiftEnd: '2026-01-03T00:00',
+    coverageStart: 10,
+    coverageEnd: 12,
+  });
+  const result = generateSchedule(config, [{ memberName: 'Alice', availability: {} }]);
+
+  assert.deepEqual(
+    result.assignments.map((a) => [a.start, a.end]),
+    [
+      [utc('2026-01-01T10:00'), utc('2026-01-01T12:00')],
+      [utc('2026-01-02T10:00'), utc('2026-01-02T12:00')],
+    ]
+  );
+});
+
+test('understaffing is only reported inside coverage', () => {
+  const config = baseConfig({
+    shiftStart: '2026-01-01T00:00',
+    shiftEnd: '2026-01-02T00:00',
+    coverageStart: 9,
+    coverageEnd: 17,
+    stdOnShift: 2,
+  });
+  const result = generateSchedule(config, [{ memberName: 'Alice', availability: {} }]);
+
+  assert.deepEqual(result.understaffed, [
+    { start: utc('2026-01-01T09:00'), end: utc('2026-01-01T17:00'), required: 2, filled: 1 },
+  ]);
+});
+
+test('night rules apply only where night overlaps coverage', () => {
+  // Night 22-06, coverage 18-02: the 22-02 overlap is a night block (no 3h
+  // cap), 02-06 is never scheduled.
+  const config = baseConfig({
+    shiftStart: '2026-01-01T12:00',
+    shiftEnd: '2026-01-02T12:00',
+    coverageStart: 18,
+    coverageEnd: 2,
+    nightShifts: true,
+    nightShiftStart: 22,
+    nightShiftEnd: 6,
+    nightOnShift: 1,
+    numMembers: 3,
+  });
+  const members: MemberAvailability[] = ['A', 'B', 'C'].map((memberName) => ({ memberName, availability: {} }));
+
+  const result = generateSchedule(config, members);
+
+  assertAllInside(result, (h) => h >= 18 || h < 2);
+  // Whoever is on at 22:00 carries the whole night overlap (no 3h split) and
+  // goes home exactly at the coverage edge.
+  const t22 = new Date(utc('2026-01-01T22:00')).getTime();
+  const night = result.assignments.filter(
+    (a) => new Date(a.start).getTime() <= t22 && new Date(a.end).getTime() > t22
+  );
+  assert.equal(night.length, 1);
+  assert.equal(night[0].end, utc('2026-01-02T02:00'));
 });

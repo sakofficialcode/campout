@@ -21,6 +21,9 @@ test('real-world fixture: tenting sign-up schedule respects recorded availabilit
     uuid: 'auburn-tenting',
     groupName: 'Auburn Tenting',
     numMembers: auburnTentingMembers.length,
+    coverageStart: null,
+    coverageEnd: null,
+    coverageUpdatedAt: null,
     ...auburnTentingConfig,
   };
 

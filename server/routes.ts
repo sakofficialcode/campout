@@ -13,9 +13,12 @@ import {
   getSwapRequest,
   getSwapRequestsForMember,
   memberExists,
+  removeMember,
   saveMemberAvailability,
   saveSchedule,
   setSwapRequestStatus,
+  updateGroupCoverage,
+  updateGroupSize,
   verifyMemberPassword,
 } from './db.ts';
 import { generateSchedule } from './scheduler.ts';
@@ -23,6 +26,30 @@ import { applySwap } from './swaps.ts';
 import type { CreateGroupPayload } from './types.ts';
 
 export const router = Router();
+
+const MAX_GROUP_SIZE = 64;
+
+function isValidGroupSize(n: unknown): n is number {
+  return typeof n === 'number' && Number.isInteger(n) && n >= 1 && n <= MAX_GROUP_SIZE;
+}
+
+const isHour = (n: unknown): n is number => typeof n === 'number' && Number.isInteger(n) && n >= 0 && n <= 23;
+
+// Coverage is either off (both null/absent = around the clock) or two distinct
+// whole hours; end <= start means the window runs past midnight.
+function parseCoverage(
+  start: unknown,
+  end: unknown
+): { ok: true; start: number | null; end: number | null } | { ok: false; error: string } {
+  if (start == null && end == null) return { ok: true, start: null, end: null };
+  if (!isHour(start) || !isHour(end)) {
+    return { ok: false, error: 'Daily hours must be whole hours from 0 to 23' };
+  }
+  if (start === end) {
+    return { ok: false, error: 'Daily hours need a different start and end — use around the clock for 24h coverage' };
+  }
+  return { ok: true, start, end };
+}
 
 router.post('/groups', async (req, res) => {
   const body = req.body as Partial<CreateGroupPayload>;
@@ -39,7 +66,22 @@ router.post('/groups', async (req, res) => {
     return;
   }
 
-  const uuid = await createGroup(body as CreateGroupPayload);
+  if (!isValidGroupSize(body.numMembers)) {
+    res.status(400).json({ error: `Group size must be a whole number from 1 to ${MAX_GROUP_SIZE}` });
+    return;
+  }
+
+  const coverage = parseCoverage(body.coverageStart, body.coverageEnd);
+  if (!coverage.ok) {
+    res.status(400).json({ error: coverage.error });
+    return;
+  }
+
+  const uuid = await createGroup({
+    ...(body as CreateGroupPayload),
+    coverageStart: coverage.start,
+    coverageEnd: coverage.end,
+  });
   res.status(201).json({ uuid });
 });
 
@@ -108,6 +150,10 @@ router.put('/groups/:uuid/members/:memberName', async (req, res) => {
     res.status(401).json({ error: 'Incorrect password' });
     return;
   }
+  if (result.status === 'group_full') {
+    res.status(409).json({ error: `This group is full (${result.numMembers} of ${result.numMembers} members)` });
+    return;
+  }
 
   res.json({ memberName: req.params.memberName, updatedAt: result.updatedAt, created: result.created });
 });
@@ -117,6 +163,89 @@ async function checkAdminPassword(uuid: string, password: string | null | undefi
   if (!hash) return true; // no password set — endpoint is open
   return typeof password === 'string' && verifyPassword(password, hash);
 }
+
+router.patch('/groups/:uuid/size', async (req, res) => {
+  const group = await getGroup(req.params.uuid);
+  if (!group) {
+    res.status(404).json({ error: 'Group not found' });
+    return;
+  }
+
+  if (!(await checkAdminPassword(req.params.uuid, req.body?.adminPassword))) {
+    res.status(403).json({ error: 'Incorrect admin password' });
+    return;
+  }
+
+  const numMembers = req.body?.numMembers;
+  if (!isValidGroupSize(numMembers)) {
+    res.status(400).json({ error: `Group size must be a whole number from 1 to ${MAX_GROUP_SIZE}` });
+    return;
+  }
+
+  const minForShifts = Math.max(group.stdOnShift, group.nightShifts ? group.nightOnShift ?? 0 : 0);
+  if (numMembers < minForShifts) {
+    res.status(400).json({ error: `Group size can't be smaller than the ${minForShifts} people needed per shift` });
+    return;
+  }
+
+  const result = await updateGroupSize(req.params.uuid, numMembers);
+  switch (result.status) {
+    case 'not_found':
+      res.status(404).json({ error: 'Group not found' });
+      return;
+    case 'below_member_count':
+      res.status(409).json({
+        error: `${result.memberCount} people have already joined — remove members before shrinking the group below ${result.memberCount}`,
+      });
+      return;
+    case 'ok':
+      res.json({ numMembers: result.numMembers });
+      return;
+  }
+});
+
+router.patch('/groups/:uuid/coverage', async (req, res) => {
+  const group = await getGroup(req.params.uuid);
+  if (!group) {
+    res.status(404).json({ error: 'Group not found' });
+    return;
+  }
+
+  if (!(await checkAdminPassword(req.params.uuid, req.body?.adminPassword))) {
+    res.status(403).json({ error: 'Incorrect admin password' });
+    return;
+  }
+
+  const coverage = parseCoverage(req.body?.coverageStart, req.body?.coverageEnd);
+  if (!coverage.ok) {
+    res.status(400).json({ error: coverage.error });
+    return;
+  }
+
+  // The saved schedule is left alone; the admin regenerates to apply new hours.
+  await updateGroupCoverage(req.params.uuid, coverage.start, coverage.end);
+  res.json({ coverageStart: coverage.start, coverageEnd: coverage.end });
+});
+
+router.delete('/groups/:uuid/members/:memberName', async (req, res) => {
+  const group = await getGroup(req.params.uuid);
+  if (!group) {
+    res.status(404).json({ error: 'Group not found' });
+    return;
+  }
+
+  if (!(await checkAdminPassword(req.params.uuid, req.body?.adminPassword))) {
+    res.status(403).json({ error: 'Incorrect admin password' });
+    return;
+  }
+
+  if (!(await removeMember(req.params.uuid, req.params.memberName))) {
+    res.status(404).json({ error: 'No member with that name' });
+    return;
+  }
+
+  res.status(204).end();
+});
 
 router.post('/groups/:uuid/schedule/generate', async (req, res) => {
   const group = await getGroup(req.params.uuid);

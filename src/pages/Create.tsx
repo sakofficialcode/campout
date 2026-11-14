@@ -8,6 +8,8 @@ import { CheckIcon, ChevronDownIcon, Minus, Plus } from 'lucide-react';
 import { NumberField } from '@base-ui/react/number-field';
 import { Fieldset, Slider, Switch } from '@base-ui/react';
 import { createGroup } from '../lib/api';
+import CoverageEditor from '../components/CoverageEditor';
+import { inHourWindow, isCoveredHour, totalCoveredHours, type Coverage } from '../lib/coverage';
 
 const timeGranularity = [
   { label: '15 minutes', value: 15 },
@@ -32,6 +34,15 @@ export default function Create() {
   const [nightShifts, setNightShifts] = React.useState(false);
   const [nightHours, setNightHours] = React.useState([22, 30]); // 10 PM to 6 AM (on a noon-to-noon slider domain)
   const [selectedGranularity, setSelectedGranularity] = React.useState<15 | 30 | 60>(30);
+  const [coverage, setCoverage] = React.useState<Coverage | null>(null);
+  const [shiftStartValue, setShiftStartValue] = React.useState('');
+  const [shiftEndValue, setShiftEndValue] = React.useState('');
+
+  const night = nightShifts ? { start: nightHours[0] % 24, end: nightHours[1] % 24 } : null;
+  const nightOverlapsCoverage =
+    night === null ||
+    Array.from({ length: 24 }, (_, h) => h).some((h) => isCoveredHour(h, coverage) && inHourWindow(h, night.start, night.end));
+  const totalHours = totalCoveredHours(shiftStartValue, shiftEndValue, coverage);
 
   return (
     <div className="ui-page py-8">
@@ -49,6 +60,10 @@ export default function Create() {
               setErrors({ submit: 'Please fill in all required fields' });
               return;
             }
+            if (coverage && coverage.start === coverage.end) {
+              setErrors({ submit: 'Daily hours need a different start and end time' });
+              return;
+            }
 
             const payload = {
               groupName: formData.get('groupName') as string,
@@ -63,6 +78,8 @@ export default function Create() {
                 nightShiftEnd: nightHours[1] % 24,
                 nightOnShift: Number(formData.get('nightOnShift')),
               }),
+              coverageStart: coverage?.start ?? null,
+              coverageEnd: coverage?.end ?? null,
               adminPassword: (formData.get('adminPassword') as string) || null,
             };
 
@@ -154,6 +171,7 @@ export default function Create() {
               <Field.Control
                 type="datetime-local"
                 required
+                onChange={(e) => setShiftStartValue(e.target.value)}
                 className="ui-input"
               />
               <Field.Error className="text-sm text-red-600" />
@@ -166,6 +184,7 @@ export default function Create() {
               <Field.Control
                 type="datetime-local"
                 required
+                onChange={(e) => setShiftEndValue(e.target.value)}
                 className="ui-input"
               />
               <Field.Error className="text-sm text-red-600" />
@@ -212,6 +231,17 @@ export default function Create() {
             </Select.Root>
           </Field.Root>
 
+          {/* Daily coverage window */}
+          <fieldset className="flex flex-col gap-2">
+            <legend className="ui-label">When do shifts need covering?</legend>
+            <CoverageEditor
+              value={coverage}
+              onChange={setCoverage}
+              night={night}
+              extraSummary={totalHours != null ? `~${Math.round(totalHours)} h total` : undefined}
+            />
+          </fieldset>
+
           {/* Night Shifts Toggle */}
           <Field.Root name="nightShifts" className="flex items-center gap-3 py-2">
             <Switch.Root
@@ -257,6 +287,11 @@ export default function Create() {
                     </Slider.Control>
                   </Slider.Root>
                 </Fieldset.Root>
+                {!nightOverlapsCoverage && (
+                  <p className="text-sm text-amber-700">
+                    No night hours fall inside your coverage window, so night rules won't apply.
+                  </p>
+                )}
               </Field.Root>
 
               <Field.Root name="nightOnShift">

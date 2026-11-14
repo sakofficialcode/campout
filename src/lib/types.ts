@@ -13,6 +13,9 @@ export interface GroupConfig {
   nightShiftStart: number | null;
   nightShiftEnd: number | null;
   nightOnShift: number | null;
+  coverageStart: number | null;
+  coverageEnd: number | null;
+  coverageUpdatedAt: string | null;
   hasAdminPassword: boolean;
   members: MemberInfo[];
 }
@@ -33,6 +36,8 @@ export interface CreateGroupPayload {
   nightShiftStart?: number;
   nightShiftEnd?: number;
   nightOnShift?: number;
+  coverageStart?: number | null;
+  coverageEnd?: number | null;
   adminPassword?: string | null;
 }
 

@@ -1,5 +1,6 @@
 import { useMemo, useRef, useState } from 'react';
 import type { ScheduleResult, SwapRequest, UnderstaffedRange } from '../lib/types';
+import { isCoveredHour, type Coverage } from '../lib/coverage';
 import { getMemberColor, UNDERSTAFFED_COLOR } from '../lib/colors';
 
 // Tall enough that a single 15-minute slot (20px) still fits a one-line label.
@@ -228,9 +229,12 @@ interface Props {
   // Everyone who submitted availability, so members given no shifts still
   // count (as 0h) in the workload stats instead of silently dropping out.
   memberNames?: string[];
+  // The group's daily window; hours outside it are shaded as "not scheduled"
+  // so they don't read as gaps. null/absent = around the clock.
+  coverage?: Coverage | null;
 }
 
-export default function ScheduleResults({ result, interactive, previewRequest, memberNames }: Props) {
+export default function ScheduleResults({ result, interactive, previewRequest, memberNames, coverage = null }: Props) {
   const [weekOffset, setWeekOffset] = useState(0);
   const [selections, setSelections] = useState<Partial<Record<SelectionSlot, RangeSelection>>>({});
   const [proposal, setProposal] = useState<ProposalState>(EMPTY_PROPOSAL);
@@ -339,6 +343,18 @@ export default function ScheduleResults({ result, interactive, previewRequest, m
     for (let m = windowStartMin; m <= windowEndMin; m += 60) marks.push(m);
     return marks;
   }, [windowStartMin, windowEndMin]);
+
+  // Contiguous uncovered hour runs inside the visible window, in minutes of day.
+  const offHours = useMemo(() => {
+    const runs: { startMin: number; endMin: number }[] = [];
+    for (let m = windowStartMin; m < windowEndMin; m += 60) {
+      if (isCoveredHour(m / 60, coverage)) continue;
+      const last = runs[runs.length - 1];
+      if (last && last.endMin === m) last.endMin = m + 60;
+      else runs.push({ startMin: m, endMin: m + 60 });
+    }
+    return runs;
+  }, [windowStartMin, windowEndMin, coverage]);
 
   const totalWeeks = Math.max(1, Math.ceil(days.length / 7));
   const visibleDays = days.slice(weekOffset * 7, weekOffset * 7 + 7);
@@ -707,6 +723,20 @@ export default function ScheduleResults({ result, interactive, previewRequest, m
                           className="absolute left-0 right-0 border-t border-dashed border-gray-100"
                           style={{ top: `${pctTop(m + 30)}%` }}
                         />
+                      ))}
+
+                      {offHours.map((run) => (
+                        <div
+                          key={`off-${run.startMin}`}
+                          title="Not scheduled"
+                          className="absolute left-0 right-0 flex items-start justify-center bg-gray-100 pt-1 text-[10px] text-gray-400"
+                          style={{
+                            top: `${pctTop(run.startMin)}%`,
+                            height: `${pctHeight(run.startMin, run.endMin)}%`,
+                          }}
+                        >
+                          Not scheduled
+                        </div>
                       ))}
 
                       {gaps.map((gap, idx) => (

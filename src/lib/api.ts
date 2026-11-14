@@ -154,3 +154,39 @@ export async function respondToSwapRequest(
   });
   return parseOrThrow(response);
 }
+
+export async function updateGroupSize(
+  uuid: string,
+  numMembers: number,
+  adminPassword: string | null
+): Promise<{ numMembers: number }> {
+  const response = await fetch(apiUrl(`/api/groups/${uuid}/size`), {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ numMembers, adminPassword }),
+  });
+  return parseOrThrow(response);
+}
+
+export async function removeMember(uuid: string, memberName: string, adminPassword: string | null): Promise<void> {
+  const response = await fetch(apiUrl(`/api/groups/${uuid}/members/${encodeURIComponent(memberName)}`), {
+    method: 'DELETE',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ adminPassword }),
+  });
+  await parseOrThrow(response);
+}
+
+export async function updateGroupCoverage(
+  uuid: string,
+  coverageStart: number | null,
+  coverageEnd: number | null,
+  adminPassword: string | null
+): Promise<{ coverageStart: number | null; coverageEnd: number | null }> {
+  const response = await fetch(apiUrl(`/api/groups/${uuid}/coverage`), {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ coverageStart, coverageEnd, adminPassword }),
+  });
+  return parseOrThrow(response);
+}

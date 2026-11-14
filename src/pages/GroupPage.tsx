@@ -3,12 +3,13 @@ import { Link, useParams } from 'react-router-dom';
 import WeekScheduler from './WeekScheduler';
 import { getGroup, loginMember, saveMemberAvailability } from '../lib/api';
 import type { AvailabilityMap, GroupConfig } from '../lib/types';
+import { coverageFromGroup, coverageLabel } from '../lib/coverage';
 
 function storageKey(uuid: string) {
   return `campout:lastName:${uuid}`;
 }
 
-type AuthStatus = 'idle' | 'checking' | 'existing' | 'new' | 'invalid';
+type AuthStatus = 'idle' | 'checking' | 'existing' | 'new' | 'full' | 'invalid';
 
 export default function GroupPage() {
   const { uuid = '' } = useParams<{ uuid: string }>();
@@ -23,6 +24,7 @@ export default function GroupPage() {
 
   const [loadedAvailability, setLoadedAvailability] = React.useState<AvailabilityMap>({});
   const [currentAvailability, setCurrentAvailability] = React.useState<AvailabilityMap>({});
+  const [memberUpdatedAt, setMemberUpdatedAt] = React.useState<string | null>(null);
 
   const [saveStatus, setSaveStatus] = React.useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
   const [saveError, setSaveError] = React.useState<string | null>(null);
@@ -51,11 +53,17 @@ export default function GroupPage() {
       if (member) {
         setLoadedAvailability(member.availability);
         setCurrentAvailability(member.availability);
+        setMemberUpdatedAt(member.updatedAt);
         setAuthStatus('existing');
       } else {
+        // Re-fetch so the full check uses the live member count, not the one
+        // from page load. The server enforces this too on submit.
+        const fresh = await getGroup(uuid);
+        setGroup(fresh);
         setLoadedAvailability({});
         setCurrentAvailability({});
-        setAuthStatus('new');
+        setMemberUpdatedAt(null);
+        setAuthStatus(fresh.members.length >= fresh.numMembers ? 'full' : 'new');
       }
       localStorage.setItem(storageKey(uuid), trimmed);
     } catch (err) {
@@ -86,7 +94,8 @@ export default function GroupPage() {
     setSaveStatus('saving');
     setSaveError(null);
     try {
-      await saveMemberAvailability(uuid, trimmed, currentAvailability, memberPassword);
+      const saved = await saveMemberAvailability(uuid, trimmed, currentAvailability, memberPassword);
+      setMemberUpdatedAt(saved.updatedAt);
       setAuthStatus('existing');
       setSaveStatus('saved');
     } catch (err) {
@@ -112,6 +121,14 @@ export default function GroupPage() {
   }
 
   const unlocked = authStatus === 'existing' || authStatus === 'new';
+  const coverage = coverageFromGroup(group);
+  // Hours were changed after this member last submitted — any newly added
+  // hours default to "available" until they look.
+  const hoursChangedSinceSubmit =
+    authStatus === 'existing' &&
+    group.coverageUpdatedAt != null &&
+    memberUpdatedAt != null &&
+    memberUpdatedAt < group.coverageUpdatedAt;
 
   return (
     <div className="ui-page">
@@ -129,8 +146,9 @@ export default function GroupPage() {
             </div>
           </div>
           <p className="text-sm text-gray-600 mt-1">
-            {group.numMembers} members &middot; {group.stdOnShift} per shift
+            {group.members.length} of {group.numMembers} joined &middot; {group.stdOnShift} per shift
             {group.nightShifts ? ` (${group.nightOnShift} at night)` : ''}
+            {coverage && <> &middot; {coverageLabel(coverage)}</>}
           </p>
 
           <form onSubmit={handleContinue} className="mt-4 flex flex-wrap items-end gap-4">
@@ -169,7 +187,18 @@ export default function GroupPage() {
               No account yet for this name — submitting availability will create one with this password.
             </p>
           )}
+          {authStatus === 'full' && (
+            <p className="mt-2 text-sm text-red-600">
+              This group is full ({group.numMembers} of {group.numMembers} members). Ask the group admin to make room
+              for you, or check that your name matches the one you joined with.
+            </p>
+          )}
           {authStatus === 'existing' && <p className="mt-2 text-sm text-green-700">Welcome back, {memberName.trim()}.</p>}
+          {hoursChangedSinceSubmit && (
+            <p className="mt-2 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
+              The group's hours changed since you last submitted — please review your availability and submit again.
+            </p>
+          )}
           {authStatus === 'invalid' && <p className="mt-2 text-sm text-red-600">{authError}</p>}
         </div>
 
@@ -186,6 +215,8 @@ export default function GroupPage() {
                 nightShifts={group.nightShifts}
                 nightShiftStart={group.nightShiftStart}
                 nightShiftEnd={group.nightShiftEnd}
+                coverageStart={group.coverageStart}
+                coverageEnd={group.coverageEnd}
               />
             </div>
 

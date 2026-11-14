@@ -57,15 +57,25 @@ function getStatus(availability: AvailabilityMap, key: string): AvailabilityStat
   return raw as AvailabilityStatus;
 }
 
-export function isNightSlot(
-  slotStart: Date,
-  nightShiftStart: number,
-  nightShiftEnd: number
-): boolean {
+// [start, end) in whole hours of the (UTC-anchored) wall clock; end <= start
+// wraps past midnight.
+export function inHourWindow(slotStart: Date, start: number, end: number): boolean {
   const hour = slotStart.getUTCHours() + slotStart.getUTCMinutes() / 60;
-  return nightShiftStart <= nightShiftEnd
-    ? hour >= nightShiftStart && hour < nightShiftEnd
-    : hour >= nightShiftStart || hour < nightShiftEnd;
+  return start <= end ? hour >= start && hour < end : hour >= start || hour < end;
+}
+
+export function isNightSlot(slotStart: Date, nightShiftStart: number, nightShiftEnd: number): boolean {
+  return inHourWindow(slotStart, nightShiftStart, nightShiftEnd);
+}
+
+// Outside the group's daily coverage window nobody is scheduled at all. No
+// window configured = around the clock.
+export function isCoveredSlot(
+  slotStart: Date,
+  config: Pick<GroupConfig, 'coverageStart' | 'coverageEnd'>
+): boolean {
+  if (config.coverageStart == null || config.coverageEnd == null) return true;
+  return inHourWindow(slotStart, config.coverageStart, config.coverageEnd);
 }
 
 interface MemberState {
@@ -121,6 +131,7 @@ export function generateSchedule(
       s < end && count < maxSlotsPerShift;
       s = addMinutes(s, granularity)
     ) {
+      if (!isCoveredSlot(s, config)) break;
       if (getStatus(availability, slotKey(s)) === 'unavailable') break;
       count++;
     }
@@ -148,6 +159,16 @@ export function generateSchedule(
   for (let slotStart = new Date(start); slotStart < end; slotStart = addMinutes(slotStart, granularity)) {
     const slotEnd = addMinutes(slotStart, granularity);
     const key = slotKey(slotStart);
+
+    // Off-hours: everyone on shift goes home (it counts as their rest), and
+    // nothing is required, so nothing can be understaffed.
+    if (!isCoveredSlot(slotStart, config)) {
+      for (const state of states.values()) {
+        if (state.openStart !== null) closeShift(state);
+        state.streakSlots = 0;
+      }
+      continue;
+    }
 
     const isNight =
       config.nightShifts &&
@@ -258,7 +279,7 @@ export function generateSchedule(
         const availability = availabilityByName.get(q.memberName)!;
         for (let k = 1; k <= withinSlots; k++) {
           const later = addMinutes(slotStart, k * granularity);
-          if (later >= end) return false;
+          if (later >= end || !isCoveredSlot(later, config)) return false;
           if (
             getStatus(availability, slotKey(later)) === 'available' &&
             (q.cooldownUntil === null || q.cooldownUntil <= later) &&
