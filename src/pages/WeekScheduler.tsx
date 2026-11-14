@@ -34,6 +34,14 @@ function isNightHour(hour: number, nightStart: number, nightEnd: number): boolea
   return nightStart <= nightEnd ? hour >= nightStart && hour < nightEnd : hour >= nightStart || hour < nightEnd;
 }
 
+// Midnight at the end of `d`'s local calendar day.
+function dayEnd(d: Date): Date {
+  const e = new Date(d);
+  e.setHours(0, 0, 0, 0);
+  e.setDate(e.getDate() + 1);
+  return e;
+}
+
 function dateStrOf(d: Date): string {
   return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
 }
@@ -317,7 +325,10 @@ export default function WeekScheduler({
         date,
         dateStr:
           date.getFullYear() + '-' + String(date.getMonth() + 1).padStart(2, '0') + '-' + String(date.getDate()).padStart(2, '0'),
-        isInRange: date >= new Date(startDateTime) && date <= new Date(endDateTime),
+        // Any overlap with the event counts — `date` is midnight, so comparing
+        // it to a mid-day start would grey out the whole first day. Exact
+        // per-cell bounds are left to isCellValid.
+        isInRange: date < new Date(endDateTime) && dayEnd(date) > new Date(startDateTime),
       });
     }
 
