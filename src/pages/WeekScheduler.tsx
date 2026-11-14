@@ -275,12 +275,26 @@ export default function WeekScheduler({
 
     const diffMs = end.getTime() - start.getTime();
     const diffDays = Math.ceil(diffMs / (1000 * 60 * 60 * 24)) + 1;
-    const weeks = Math.ceil(diffDays / 7);
 
-    const weekStart = new Date(start);
-    weekStart.setDate(weekStart.getDate() - weekStart.getDay() + currentWeekOffset * 7);
+    // Weeks are Sunday-aligned calendar weeks, so count from the Sunday on or
+    // before the start to the Sunday on or before the last covered instant —
+    // not diffDays / 7, which says a Sat–Tue event fits in one week. An event
+    // ending exactly at midnight doesn't spill into an extra empty week.
+    const sundayOf = (d: Date) => {
+      const s = new Date(d);
+      s.setHours(0, 0, 0, 0);
+      s.setDate(s.getDate() - s.getDay());
+      return s;
+    };
+    const firstSunday = sundayOf(start);
+    const lastSunday = sundayOf(new Date(Math.max(start.getTime(), end.getTime() - 1)));
+    // Round, not floor: a DST change makes the gap an hour off a whole week.
+    const weeks = Math.round((lastSunday.getTime() - firstSunday.getTime()) / (7 * 24 * 60 * 60 * 1000)) + 1;
 
-    const daysInWeek = Math.min(7, diffDays - currentWeekOffset * 7);
+    const weekStart = new Date(firstSunday);
+    weekStart.setDate(weekStart.getDate() + currentWeekOffset * 7);
+
+    const daysInWeek = currentWeekOffset < weeks ? 7 : 0;
 
     return {
       totalDays: diffDays,
