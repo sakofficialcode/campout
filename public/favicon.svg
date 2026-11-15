@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <style>
+    .ink { fill: #0a0a0a; stroke: #0a0a0a; }
+    .pole { fill: none; }
+    @media (prefers-color-scheme: dark) {
+      .ink { fill: #fafafa; stroke: #fafafa; }
+      .pole { fill: none; }
+    }
+  </style>
+  <path class="ink pole" d="M16 3v4" stroke-width="2" stroke-linecap="round"/>
+  <path d="M16 3l5.5 2L16 7z" fill="#f97316"/>
+  <path class="ink" d="M16 8L4.5 27h23z" stroke-width="2" stroke-linejoin="round"/>
+  <path d="M16 15.5l-4 11.5h8z" fill="#fdba74"/>
+</svg>

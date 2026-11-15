@@ -30,7 +30,7 @@ function toDateStr(d: Date): string {
   );
 }
 
-function slotKey(d: Date): string {
+export function slotKey(d: Date): string {
   const minutes = d.getUTCHours() * 60 + d.getUTCMinutes();
   return `${toDateStr(d)}-${minutes}`;
 }
@@ -50,7 +50,7 @@ function parseWallClock(s: string): Date {
 
 // Legacy saved data may still hold a raw boolean (`true` = unavailable);
 // normalize it alongside the current 3-state representation.
-function getStatus(availability: AvailabilityMap, key: string): AvailabilityStatus {
+export function getStatus(availability: AvailabilityMap, key: string): AvailabilityStatus {
   const raw = availability[key] as unknown;
   if (raw === true) return 'unavailable';
   if (raw === false || raw === undefined) return 'available';
@@ -76,6 +76,59 @@ export function isCoveredSlot(
 ): boolean {
   if (config.coverageStart == null || config.coverageEnd == null) return true;
   return inHourWindow(slotStart, config.coverageStart, config.coverageEnd);
+}
+
+function isNightFor(slotStart: Date, config: GroupConfig): boolean {
+  return (
+    config.nightShifts &&
+    config.nightShiftStart != null &&
+    config.nightShiftEnd != null &&
+    isNightSlot(slotStart, config.nightShiftStart, config.nightShiftEnd)
+  );
+}
+
+// How many people the slot starting at `slotStart` needs: 0 outside the daily
+// coverage window, the night count at night, the standard count otherwise.
+// Shared by generateSchedule and recomputeUnderstaffed so they can't disagree.
+export function requiredOnShift(slotStart: Date, config: GroupConfig): number {
+  if (!isCoveredSlot(slotStart, config)) return 0;
+  return isNightFor(slotStart, config) ? config.nightOnShift ?? config.stdOnShift : config.stdOnShift;
+}
+
+// Runs of consecutive slots with the same (required, filled) become one range.
+function mergeUnderstaffedSlots(slots: UnderstaffedRange[]): UnderstaffedRange[] {
+  const understaffed: UnderstaffedRange[] = [];
+  for (const slot of slots) {
+    const prev = understaffed[understaffed.length - 1];
+    if (prev && prev.end === slot.start && prev.required === slot.required && prev.filled === slot.filled) {
+      prev.end = slot.end;
+    } else {
+      understaffed.push({ ...slot });
+    }
+  }
+  return understaffed;
+}
+
+// After a manual edit (assign, reassign, swap), re-derive the understaffed
+// list from the shifts as they now stand, using the same per-slot rule the
+// scheduler used. "Filled" counts distinct people, so a double-booked person
+// counts once.
+export function recomputeUnderstaffed(config: GroupConfig, assignments: ShiftAssignment[]): UnderstaffedRange[] {
+  const start = parseWallClock(config.shiftStart);
+  const end = parseWallClock(config.shiftEnd);
+  const step = config.timeGranularity;
+  const spans = assignments.map((a) => ({ name: a.memberName, start: Date.parse(a.start), end: Date.parse(a.end) }));
+  const slots: UnderstaffedRange[] = [];
+  for (let s = start; s < end; s = addMinutes(s, step)) {
+    const required = requiredOnShift(s, config);
+    if (required === 0) continue;
+    const t = s.getTime();
+    const filled = new Set(spans.filter((a) => a.start <= t && t < a.end).map((a) => a.name)).size;
+    if (filled < required) {
+      slots.push({ start: s.toISOString(), end: addMinutes(s, step).toISOString(), required, filled });
+    }
+  }
+  return mergeUnderstaffedSlots(slots);
 }
 
 interface MemberState {
@@ -160,9 +213,11 @@ export function generateSchedule(
     const slotEnd = addMinutes(slotStart, granularity);
     const key = slotKey(slotStart);
 
+    const required = requiredOnShift(slotStart, config);
+
     // Off-hours: everyone on shift goes home (it counts as their rest), and
     // nothing is required, so nothing can be understaffed.
-    if (!isCoveredSlot(slotStart, config)) {
+    if (required === 0) {
       for (const state of states.values()) {
         if (state.openStart !== null) closeShift(state);
         state.streakSlots = 0;
@@ -170,13 +225,7 @@ export function generateSchedule(
       continue;
     }
 
-    const isNight =
-      config.nightShifts &&
-      config.nightShiftStart != null &&
-      config.nightShiftEnd != null &&
-      isNightSlot(slotStart, config.nightShiftStart, config.nightShiftEnd);
-
-    const required = isNight ? config.nightOnShift ?? config.stdOnShift : config.stdOnShift;
+    const isNight = isNightFor(slotStart, config);
     // Night hours are all-or-nothing: the max-shift cap doesn't apply, so
     // whoever is on covers the whole window instead of handing off mid-night.
     const effectiveMaxSlots = isNight ? Infinity : maxSlotsPerShift;
@@ -343,15 +392,7 @@ export function generateSchedule(
 
   assignments.sort((a, b) => a.start.localeCompare(b.start) || a.memberName.localeCompare(b.memberName));
 
-  const understaffed: UnderstaffedRange[] = [];
-  for (const slot of understaffedSlots) {
-    const prev = understaffed[understaffed.length - 1];
-    if (prev && prev.end === slot.start && prev.required === slot.required && prev.filled === slot.filled) {
-      prev.end = slot.end;
-    } else {
-      understaffed.push({ ...slot });
-    }
-  }
+  const understaffed = mergeUnderstaffedSlots(understaffedSlots);
 
   return {
     generatedAt: new Date().toISOString(),

@@ -19,10 +19,12 @@ import {
   setSwapRequestStatus,
   updateGroupCoverage,
   updateGroupSize,
+  updateScheduleLocked,
   verifyMemberPassword,
 } from './db.ts';
-import { generateSchedule } from './scheduler.ts';
-import { applySwap } from './swaps.ts';
+import { generateSchedule, recomputeUnderstaffed } from './scheduler.ts';
+import { applySwap, assignRange, mergeContiguous, reassignRange } from './swaps.ts';
+import { conflictsForRange } from './conflicts.ts';
 import type { CreateGroupPayload } from './types.ts';
 
 export const router = Router();
@@ -286,6 +288,155 @@ router.post('/groups/:uuid/schedule/view', async (req, res) => {
   res.json(result);
 });
 
+const MAX_CONFLICT_RANGE_MS = 7 * 24 * 60 * 60_000;
+
+function isIsoRange(start: unknown, end: unknown): start is string {
+  return (
+    typeof start === 'string' &&
+    typeof end === 'string' &&
+    !Number.isNaN(Date.parse(start)) &&
+    !Number.isNaN(Date.parse(end)) &&
+    Date.parse(start) < Date.parse(end) &&
+    Date.parse(end) - Date.parse(start) <= MAX_CONFLICT_RANGE_MS
+  );
+}
+
+// Who can cover [start, end)? Returns only a per-person verdict (ok /
+// not_preferred / unavailable / on_shift), never anyone's availability map.
+// Callable by a logged-in member (for the swap picker) or the admin.
+router.post('/groups/:uuid/schedule/conflicts', async (req, res) => {
+  const group = await getGroup(req.params.uuid);
+  if (!group) {
+    res.status(404).json({ error: 'Group not found' });
+    return;
+  }
+
+  const { start, end, memberName, password, adminPassword } = req.body ?? {};
+  if (!isIsoRange(start, end)) {
+    res.status(400).json({ error: 'A valid start/end range (up to 7 days) is required' });
+    return;
+  }
+
+  const asMember =
+    typeof memberName === 'string' &&
+    typeof password === 'string' &&
+    (await verifyMemberPassword(req.params.uuid, memberName, password));
+  const asAdmin = !asMember && (await checkAdminPassword(req.params.uuid, adminPassword));
+  if (!asMember && !asAdmin) {
+    res.status(401).json({ error: 'Log in to see availability conflicts' });
+    return;
+  }
+
+  const [members, schedule] = await Promise.all([getMembersForGroup(req.params.uuid), getSchedule(req.params.uuid)]);
+  res.json({
+    conflicts: conflictsForRange(members, schedule?.assignments ?? [], start, end as string, group.timeGranularity),
+  });
+});
+
+// Admin edit: hand part or all of one member's shift to someone else, applied
+// immediately (no request/accept). Conflicts are a warning in the UI, not a
+// block here — the admin may knowingly double-book or override availability.
+router.post('/groups/:uuid/schedule/reassign', async (req, res) => {
+  const group = await getGroup(req.params.uuid);
+  if (!group) {
+    res.status(404).json({ error: 'Group not found' });
+    return;
+  }
+
+  if (!(await checkAdminPassword(req.params.uuid, req.body?.adminPassword))) {
+    res.status(403).json({ error: 'Incorrect admin password' });
+    return;
+  }
+
+  const { fromMember, toMember, start, end } = req.body ?? {};
+  if (typeof fromMember !== 'string' || typeof toMember !== 'string' || !fromMember || !toMember || !isIsoRange(start, end)) {
+    res.status(400).json({ error: 'fromMember, toMember, start, and end are required' });
+    return;
+  }
+
+  if (!(await memberExists(req.params.uuid, toMember))) {
+    res.status(404).json({ error: 'No member with that name' });
+    return;
+  }
+
+  const outcome = await updateScheduleLocked(req.params.uuid, (schedule) => {
+    const result = reassignRange(schedule.assignments, fromMember, start, end as string, toMember);
+    return result.ok
+      ? {
+          ok: true,
+          schedule: { ...schedule, assignments: result.assignments, understaffed: recomputeUnderstaffed(group, result.assignments) },
+        }
+      : result;
+  });
+
+  switch (outcome.status) {
+    case 'no_schedule':
+      res.status(404).json({ error: 'No schedule generated yet' });
+      return;
+    case 'conflict':
+      res.status(409).json({ error: outcome.message });
+      return;
+    case 'ok':
+      res.json(outcome.schedule);
+      return;
+  }
+});
+
+// Admin fill: put someone on [start, end) — typically an understaffed gap.
+router.post('/groups/:uuid/schedule/assign', async (req, res) => {
+  const group = await getGroup(req.params.uuid);
+  if (!group) {
+    res.status(404).json({ error: 'Group not found' });
+    return;
+  }
+
+  if (!(await checkAdminPassword(req.params.uuid, req.body?.adminPassword))) {
+    res.status(403).json({ error: 'Incorrect admin password' });
+    return;
+  }
+
+  const { toMember, start, end } = req.body ?? {};
+  if (typeof toMember !== 'string' || !toMember || !isIsoRange(start, end)) {
+    res.status(400).json({ error: 'toMember, start, and end are required' });
+    return;
+  }
+
+  // Must sit inside the event (shiftStart/End are UTC-anchored wall clock).
+  const eventStart = Date.parse(`${group.shiftStart}:00.000Z`);
+  const eventEnd = Date.parse(`${group.shiftEnd}:00.000Z`);
+  if (Date.parse(start) < eventStart || Date.parse(end as string) > eventEnd) {
+    res.status(400).json({ error: 'That time is outside the event' });
+    return;
+  }
+
+  if (!(await memberExists(req.params.uuid, toMember))) {
+    res.status(404).json({ error: 'No member with that name' });
+    return;
+  }
+
+  const outcome = await updateScheduleLocked(req.params.uuid, (schedule) => {
+    const result = assignRange(schedule.assignments, toMember, start, end as string);
+    return result.ok
+      ? {
+          ok: true,
+          schedule: { ...schedule, assignments: result.assignments, understaffed: recomputeUnderstaffed(group, result.assignments) },
+        }
+      : result;
+  });
+
+  switch (outcome.status) {
+    case 'no_schedule':
+      res.status(404).json({ error: 'No schedule generated yet' });
+      return;
+    case 'conflict':
+      res.status(409).json({ error: outcome.message });
+      return;
+    case 'ok':
+      res.json(outcome.schedule);
+      return;
+  }
+});
+
 // Members view the schedule with their own name+password, not the admin
 // password — the group link alone isn't enough.
 router.post('/groups/:uuid/schedule/view-as-member', async (req, res) => {
@@ -324,7 +475,7 @@ function findAssignmentRange(
   const startMs = new Date(rangeStart).getTime();
   const endMs = new Date(rangeEnd).getTime();
   if (!(startMs < endMs)) return false;
-  return assignments.some(
+  return mergeContiguous(assignments).some(
     (a) =>
       a.memberName === memberName &&
       new Date(a.start).getTime() <= startMs &&
@@ -481,7 +632,7 @@ router.post('/groups/:uuid/swap-requests/:id/respond', async (req, res) => {
     const assignments = [...result.assignments].sort(
       (a, b) => a.start.localeCompare(b.start) || a.memberName.localeCompare(b.memberName)
     );
-    return { ok: true, schedule: { ...schedule, assignments } };
+    return { ok: true, schedule: { ...schedule, assignments, understaffed: recomputeUnderstaffed(group, assignments) } };
   });
 
   switch (outcome.status) {

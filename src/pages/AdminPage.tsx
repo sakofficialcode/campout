@@ -2,7 +2,19 @@ import * as React from 'react';
 import { Link, useParams } from 'react-router-dom';
 import ScheduleResults from '../components/ScheduleResults';
 import CoverageEditor from '../components/CoverageEditor';
-import { generateSchedule, getGroup, removeMember, updateGroupCoverage, updateGroupSize, viewSchedule } from '../lib/api';
+import {
+  ApiError,
+  assignShift,
+  generateSchedule,
+  getConflicts,
+  getGroup,
+  reassignShift,
+  removeMember,
+  updateGroupCoverage,
+  updateGroupSize,
+  viewSchedule,
+} from '../lib/api';
+import type { AdminEditConfig } from '../components/ScheduleResults';
 import { addsHours, coverageFromGroup, totalCoveredHours, type Coverage } from '../lib/coverage';
 import type { GroupConfig, ScheduleResult } from '../lib/types';
 
@@ -51,6 +63,30 @@ export default function AdminPage() {
 
   const adminPassword = group?.hasAdminPassword ? password : null;
 
+  // Show the saved schedule without a separate "view" click: straight away for
+  // open groups, and once the right admin password is typed for protected
+  // ones. Only fills an empty view — never replaces one on screen.
+  const [autoLoad, setAutoLoad] = React.useState<'pending' | 'none' | 'denied'>('pending');
+  const hasAdminPassword = group?.hasAdminPassword;
+  React.useEffect(() => {
+    if (hasAdminPassword === undefined || result) return;
+    if (hasAdminPassword && !password) return;
+    let cancelled = false;
+    const timer = setTimeout(
+      () => {
+        viewSchedule(uuid, hasAdminPassword ? password : null)
+          .then((saved) => !cancelled && setResult((current) => current ?? saved))
+          // 404 = nothing generated yet; 403 = password still being typed or wrong.
+          .catch((err) => !cancelled && setAutoLoad(err instanceof ApiError && err.status === 403 ? 'denied' : 'none'));
+      },
+      hasAdminPassword ? 400 : 0
+    );
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [uuid, hasAdminPassword, password, result]);
+
   const runMemberAction = async (action: () => Promise<unknown>, notice: string) => {
     setMembersBusy(true);
     setMembersError(null);
@@ -97,6 +133,12 @@ export default function AdminPage() {
   };
 
   const run = async (action: (uuid: string, password: string | null) => Promise<ScheduleResult>) => {
+    if (
+      result &&
+      !window.confirm('Regenerate the schedule? This replaces the current one, including any manual reassignments.')
+    ) {
+      return;
+    }
     setLoading(true);
     setScheduleError(null);
     try {
@@ -125,6 +167,20 @@ export default function AdminPage() {
   }
 
   const submittedCount = group.members.length;
+
+  // Direct schedule edits. Each reassign returns the saved schedule, which
+  // replaces what's shown, so the view never drifts from the server.
+  const adminEdit: AdminEditConfig = {
+    members: group.members.map((m) => m.memberName),
+    snapMinutes: group.timeGranularity,
+    fetchConflicts: (start, end) => getConflicts(uuid, start, end, { adminPassword }),
+    onReassign: async (fromMember, toMember, start, end) => {
+      setResult(await reassignShift(uuid, adminPassword, fromMember, toMember, start, end));
+    },
+    onAssign: async (toMember, start, end) => {
+      setResult(await assignShift(uuid, adminPassword, toMember, start, end));
+    },
+  };
   const minForShifts = Math.max(group.stdOnShift, group.nightShifts ? group.nightOnShift ?? 0 : 0);
   const minSize = Math.max(1, submittedCount, minForShifts);
   const isFull = submittedCount >= group.numMembers;
@@ -282,13 +338,17 @@ export default function AdminPage() {
         <div className="ui-card">
           <h2 className="text-lg font-bold text-gray-900 mb-4">Schedule</h2>
 
-          <div className="flex gap-3">
+          <div className="flex flex-wrap items-center gap-3">
             <button disabled={loading} onClick={() => run(generateSchedule)} className="ui-btn-primary">
-              {loading ? 'Working...' : 'Generate Schedule'}
+              {loading ? 'Working...' : result ? 'Regenerate Schedule' : 'Generate Schedule'}
             </button>
-            <button disabled={loading} onClick={() => run(viewSchedule)} className="ui-btn-secondary">
-              View Last Schedule
-            </button>
+            {!result && group.hasAdminPassword && !password && (
+              <span className="text-sm text-gray-500">Enter the admin password above to see the current schedule.</span>
+            )}
+            {!result && autoLoad === 'none' && <span className="text-sm text-gray-500">No schedule yet.</span>}
+            {!result && autoLoad === 'denied' && password && (
+              <span className="text-sm text-red-600">That admin password doesn&rsquo;t match.</span>
+            )}
           </div>
 
           {scheduleError && (
@@ -312,6 +372,7 @@ export default function AdminPage() {
               result={result}
               memberNames={group.members.map((m) => m.memberName)}
               coverage={savedCoverage}
+              adminEdit={adminEdit}
             />
           </div>
         )}

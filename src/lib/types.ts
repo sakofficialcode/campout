@@ -75,3 +75,6 @@ export interface SwapRequest {
   createdAt: string;
   respondedAt: string | null;
 }
+
+// Worst problem a person has with a time range, from the server's conflict check.
+export type ConflictStatus = 'on_shift' | 'unavailable' | 'not_preferred' | 'ok';

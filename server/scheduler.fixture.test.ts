@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { generateSchedule, isNightSlot } from './scheduler.ts';
+import { generateSchedule, recomputeUnderstaffed, isNightSlot } from './scheduler.ts';
 import type { GroupConfig } from './types.ts';
 import { auburnTentingConfig, auburnTentingMembers } from './fixtures/auburn-tenting-availability.ts';
 
@@ -80,4 +80,31 @@ test('real-world fixture: tenting sign-up schedule respects recorded availabilit
     assert.ok(u.filled < u.required, `understaffed range ${u.start}-${u.end} has filled >= required`);
     assert.ok(u.filled >= 0);
   }
+});
+
+test('recomputeUnderstaffed reproduces the scheduler\'s own understaffed list', () => {
+  const base: GroupConfig = {
+    uuid: 'auburn-tenting',
+    groupName: 'Auburn Tenting',
+    numMembers: auburnTentingMembers.length,
+    coverageStart: null,
+    coverageEnd: null,
+    coverageUpdatedAt: null,
+    ...auburnTentingConfig,
+  };
+  // Same data under a few staffing rules, so night counts and coverage gaps
+  // are exercised and the list isn't trivially empty.
+  const variants: GroupConfig[] = [
+    base,
+    { ...base, stdOnShift: 8, nightOnShift: 6 },
+    { ...base, stdOnShift: 7, nightOnShift: 5, coverageStart: 18, coverageEnd: 8 },
+    { ...base, nightShifts: false, stdOnShift: 9 },
+  ];
+  let sawUnderstaffed = false;
+  for (const config of variants) {
+    const result = generateSchedule(config, auburnTentingMembers);
+    sawUnderstaffed ||= result.understaffed.length > 0;
+    assert.deepEqual(recomputeUnderstaffed(config, result.assignments), result.understaffed);
+  }
+  assert.ok(sawUnderstaffed, 'at least one variant should be understaffed');
 });

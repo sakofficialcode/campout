@@ -436,6 +436,47 @@ export async function setSwapRequestStatus(groupId: string, id: number, status: 
   );
 }
 
+export type UpdateScheduleResult =
+  | { status: 'ok'; schedule: ScheduleResult }
+  | { status: 'no_schedule' }
+  | { status: 'conflict'; message: string };
+
+// Locked read-modify-write of a group's saved schedule, so an admin edit can't
+// race a member accepting a swap on the same row (both take FOR UPDATE).
+export async function updateScheduleLocked(
+  groupId: string,
+  compute: (schedule: ScheduleResult) => { ok: true; schedule: ScheduleResult } | { ok: false; error: string }
+): Promise<UpdateScheduleResult> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const row = await client.query<{ result_json: ScheduleResult }>(
+      'SELECT result_json FROM schedules WHERE group_id = $1 FOR UPDATE',
+      [groupId]
+    );
+    if (row.rowCount === 0) {
+      await client.query('ROLLBACK');
+      return { status: 'no_schedule' };
+    }
+    const result = compute(row.rows[0].result_json);
+    if (!result.ok) {
+      await client.query('ROLLBACK');
+      return { status: 'conflict', message: result.error };
+    }
+    await client.query('UPDATE schedules SET result_json = $1 WHERE group_id = $2', [
+      JSON.stringify(result.schedule),
+      groupId,
+    ]);
+    await client.query('COMMIT');
+    return { status: 'ok', schedule: result.schedule };
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
 export type AcceptSwapRequestResult =
   | { status: 'ok'; schedule: ScheduleResult; swapRequest: SwapRequest }
   | { status: 'not_found' }

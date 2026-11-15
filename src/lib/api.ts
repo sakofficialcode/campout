@@ -1,5 +1,6 @@
 import type {
   AvailabilityMap,
+  ConflictStatus,
   CreateGroupPayload,
   GroupConfig,
   ScheduleResult,
@@ -187,6 +188,54 @@ export async function updateGroupCoverage(
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ coverageStart, coverageEnd, adminPassword }),
+  });
+  return parseOrThrow(response);
+}
+
+export type ConflictAuth = { memberName: string; password: string } | { adminPassword: string | null };
+
+export async function getConflicts(
+  uuid: string,
+  start: string,
+  end: string,
+  auth: ConflictAuth
+): Promise<Record<string, ConflictStatus>> {
+  const response = await fetch(apiUrl(`/api/groups/${uuid}/schedule/conflicts`), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ start, end, ...auth }),
+  });
+  const data = await parseOrThrow<{ conflicts: Record<string, ConflictStatus> }>(response);
+  return data.conflicts;
+}
+
+export async function reassignShift(
+  uuid: string,
+  adminPassword: string | null,
+  fromMember: string,
+  toMember: string,
+  start: string,
+  end: string
+): Promise<ScheduleResult> {
+  const response = await fetch(apiUrl(`/api/groups/${uuid}/schedule/reassign`), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ adminPassword, fromMember, toMember, start, end }),
+  });
+  return parseOrThrow(response);
+}
+
+export async function assignShift(
+  uuid: string,
+  adminPassword: string | null,
+  toMember: string,
+  start: string,
+  end: string
+): Promise<ScheduleResult> {
+  const response = await fetch(apiUrl(`/api/groups/${uuid}/schedule/assign`), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ adminPassword, toMember, start, end }),
   });
   return parseOrThrow(response);
 }

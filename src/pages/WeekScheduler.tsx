@@ -3,6 +3,7 @@ import { ChevronLeft, ChevronRight } from 'lucide-react';
 import 'gapi-script';
 import type { AvailabilityMap, AvailabilityStatus } from '../lib/types';
 import { coverageLabel, formatClockHour, isCoveredHour, type Coverage } from '../lib/coverage';
+import { addDays, countCalendarWeeks, dayOverlapsEvent, eventDays, sundayOf, toDateStr } from '../lib/calendarWeeks';
 
 const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID;
 const GOOGLE_API_KEY = import.meta.env.VITE_GOOGLE_API_KEY;
@@ -34,17 +35,8 @@ function isNightHour(hour: number, nightStart: number, nightEnd: number): boolea
   return nightStart <= nightEnd ? hour >= nightStart && hour < nightEnd : hour >= nightStart || hour < nightEnd;
 }
 
-// Midnight at the end of `d`'s local calendar day.
-function dayEnd(d: Date): Date {
-  const e = new Date(d);
-  e.setHours(0, 0, 0, 0);
-  e.setDate(e.getDate() + 1);
-  return e;
-}
-
-function dateStrOf(d: Date): string {
-  return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
-}
+const dateStrOf = toDateStr;
+const DAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
 
 // Night hours are all-or-nothing: painting any cell inside a night's window
 // snaps every slot in that same night (which may span into the next
@@ -129,6 +121,12 @@ export default function WeekScheduler({
   // Keys look like "YYYY-MM-DD-<minuteOfDay>".
   const isCoveredKey = (key: string) => isCoveredMinute(Number(key.slice(key.lastIndexOf('-') + 1)));
   const [availability, setAvailability] = useState<AvailabilityMap>(initialAvailability);
+  // The Google import awaits network calls; read the latest map when it lands,
+  // not the one captured when the button was clicked.
+  const availabilityRef = useRef(availability);
+  useEffect(() => {
+    availabilityRef.current = availability;
+  }, [availability]);
   const [isDragging, setIsDragging] = useState(false);
   const [paintMode, setPaintMode] = useState<AvailabilityStatus>('unavailable');
   const [currentWeekOffset, setCurrentWeekOffset] = useState(0);
@@ -242,7 +240,9 @@ export default function WeekScheduler({
       }
     });
 
-    setAvailability((prev) => ({ ...prev, ...googleAvailability }));
+    // Through updateAvailability so the parent sees it too — otherwise an
+    // import followed straight by Submit silently dropped the imported times.
+    updateAvailability({ ...availabilityRef.current, ...googleAvailability });
   };
 
   useEffect(() => {
@@ -277,62 +277,33 @@ export default function WeekScheduler({
     return Array.from({ length: (24 * 60) / slotMinutes }, (_, i) => i * slotMinutes);
   }, [slotMinutes]);
 
+  // Sunday-aligned calendar weeks; see src/lib/calendarWeeks.ts (and its
+  // tests) for why this isn't days / 7.
   const { totalWeeks, daysInCurrentWeek, weekStartDate } = useMemo(() => {
     const start = new Date(startDateTime);
     const end = new Date(endDateTime);
-
-    const diffMs = end.getTime() - start.getTime();
-    const diffDays = Math.ceil(diffMs / (1000 * 60 * 60 * 24)) + 1;
-
-    // Weeks are Sunday-aligned calendar weeks, so count from the Sunday on or
-    // before the start to the Sunday on or before the last covered instant —
-    // not diffDays / 7, which says a Sat–Tue event fits in one week. An event
-    // ending exactly at midnight doesn't spill into an extra empty week.
-    const sundayOf = (d: Date) => {
-      const s = new Date(d);
-      s.setHours(0, 0, 0, 0);
-      s.setDate(s.getDate() - s.getDay());
-      return s;
-    };
-    const firstSunday = sundayOf(start);
-    const lastSunday = sundayOf(new Date(Math.max(start.getTime(), end.getTime() - 1)));
-    // Round, not floor: a DST change makes the gap an hour off a whole week.
-    const weeks = Math.round((lastSunday.getTime() - firstSunday.getTime()) / (7 * 24 * 60 * 60 * 1000)) + 1;
-
-    const weekStart = new Date(firstSunday);
-    weekStart.setDate(weekStart.getDate() + currentWeekOffset * 7);
-
-    const daysInWeek = currentWeekOffset < weeks ? 7 : 0;
-
+    const weeks = countCalendarWeeks(start, end);
     return {
-      totalDays: diffDays,
       totalWeeks: weeks,
-      daysInCurrentWeek: Math.max(0, daysInWeek),
-      weekStartDate: weekStart,
+      daysInCurrentWeek: currentWeekOffset < weeks ? 7 : 0,
+      weekStartDate: addDays(sundayOf(start), currentWeekOffset * 7),
     };
   }, [startDateTime, endDateTime, currentWeekOffset]);
 
   const daysToDisplay = useMemo(() => {
-    const days = [];
-    const dayNames = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
-
-    for (let i = 0; i < 7; i++) {
-      const date = new Date(weekStartDate);
-      date.setDate(date.getDate() + i);
-
-      days.push({
-        name: dayNames[date.getDay()],
+    const start = new Date(startDateTime);
+    const end = new Date(endDateTime);
+    return Array.from({ length: 7 }, (_, i) => {
+      const date = addDays(weekStartDate, i);
+      return {
+        name: DAY_NAMES[date.getDay()],
         date,
-        dateStr:
-          date.getFullYear() + '-' + String(date.getMonth() + 1).padStart(2, '0') + '-' + String(date.getDate()).padStart(2, '0'),
-        // Any overlap with the event counts — `date` is midnight, so comparing
-        // it to a mid-day start would grey out the whole first day. Exact
-        // per-cell bounds are left to isCellValid.
-        isInRange: date < new Date(endDateTime) && dayEnd(date) > new Date(startDateTime),
-      });
-    }
-
-    return days;
+        dateStr: toDateStr(date),
+        // Column = whole day, event = moments: overlap, never a direct compare.
+        // Exact per-cell bounds are left to isCellValid.
+        isInRange: dayOverlapsEvent(date, start, end),
+      };
+    });
   }, [weekStartDate, startDateTime, endDateTime]);
 
   const isCellValid = (dateStr: string, minutes: number) => {
@@ -441,17 +412,13 @@ export default function WeekScheduler({
   const exportToCSV = () => {
     const start = new Date(startDateTime);
     const end = new Date(endDateTime);
-    const allDays: DayItem[] = [];
-
-    for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
-      const dateStr = d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
-      const dayNames = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
-      allDays.push({
-        name: dayNames[d.getDay()],
-        dateStr: dateStr,
-        date: new Date(d),
-      });
-    }
+    // Day-by-day from midnight, not from the start's time of day — otherwise a
+    // 6 PM start steps past a 9 AM end and drops the last day.
+    const allDays: DayItem[] = eventDays(start, end).map((d) => ({
+      name: DAY_NAMES[d.getDay()],
+      dateStr: toDateStr(d),
+      date: d,
+    }));
 
     let csv = 'Time,' + allDays.map((d) => `${d.name} (${d.dateStr})`).join(',') + '\n';
 

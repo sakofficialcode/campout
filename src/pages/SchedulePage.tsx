@@ -4,7 +4,7 @@ import ScheduleResults from '../components/ScheduleResults';
 import type { InteractiveConfig } from '../components/ScheduleResults';
 import SwapRequestsPanel from '../components/SwapRequestsPanel';
 import { coverageFromGroup } from '../lib/coverage';
-import { ApiError, createSwapRequest, getGroup, listSwapRequests, viewScheduleAsMember } from '../lib/api';
+import { ApiError, createSwapRequest, getConflicts, getGroup, listSwapRequests, viewScheduleAsMember } from '../lib/api';
 import type { GroupConfig, ScheduleResult, SwapRequest } from '../lib/types';
 
 function storageKey(uuid: string) {
@@ -88,6 +88,8 @@ export default function SchedulePage() {
       viewerName: loggedIn.name,
       otherMembers: group.members.map((m) => m.memberName).filter((n) => n !== loggedIn.name),
       snapMinutes: group.timeGranularity,
+      fetchConflicts: (start, end) =>
+        getConflicts(uuid, start, end, { memberName: loggedIn.name, password: loggedIn.password }),
       onSubmit: async (proposal) => {
         await createSwapRequest(uuid, {
           fromMember: loggedIn.name,

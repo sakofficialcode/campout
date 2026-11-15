@@ -14,8 +14,9 @@
     "dev:landing": "vite --config vite.landing.config.ts",
     "build:landing": "tsc -b && vite build --config vite.landing.config.ts",
     "db:migrate": "tsx --env-file=.env server/migrate.ts",
-    "test:scheduler": "tsx --test server/scheduler.test.ts server/scheduler.fixture.test.ts",
-    "test:db": "tsx --test --env-file=.env server/db.test.ts"
+    "test:scheduler": "tsx --test server/scheduler.test.ts server/scheduler.fixture.test.ts server/conflicts.test.ts",
+    "test:db": "tsx --test --env-file=.env server/db.test.ts",
+    "test:client": "tsx --test src/lib/calendarWeeks.test.ts"
   },
   "dependencies": {
     "@base-ui/react": "^1.0.0",

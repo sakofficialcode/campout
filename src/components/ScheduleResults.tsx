@@ -1,5 +1,7 @@
-import { useMemo, useRef, useState } from 'react';
-import type { ScheduleResult, SwapRequest, UnderstaffedRange } from '../lib/types';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import type { ConflictStatus, ScheduleResult, SwapRequest, UnderstaffedRange } from '../lib/types';
+import MemberPicker from './MemberPicker';
+import { mergeContiguous } from '../lib/assignments';
 import { isCoveredHour, type Coverage } from '../lib/coverage';
 import { getMemberColor, UNDERSTAFFED_COLOR } from '../lib/colors';
 
@@ -204,7 +206,23 @@ export interface InteractiveConfig {
   otherMembers: string[];
   snapMinutes: number;
   onSubmit: (proposal: SwapProposal) => Promise<void>;
+  // Per-person verdict for the range being given away, for the picker's icons.
+  fetchConflicts?: (start: string, end: string) => Promise<Record<string, ConflictStatus>>;
 }
+
+// Admin mode: any shift can be selected, and the change applies immediately.
+export interface AdminEditConfig {
+  members: string[];
+  snapMinutes: number;
+  fetchConflicts: (start: string, end: string) => Promise<Record<string, ConflictStatus>>;
+  onReassign: (fromMember: string, toMember: string, start: string, end: string) => Promise<void>;
+  // Put someone on an understaffed stretch.
+  onAssign: (toMember: string, start: string, end: string) => Promise<void>;
+}
+
+// Selection "owner" for an understaffed gap rather than a person's shift. The
+// NUL prefix can't collide with a real member name.
+const GAP_OWNER = '\u0000gap';
 
 interface ProposalState {
   toMember: string;
@@ -232,22 +250,45 @@ interface Props {
   // The group's daily window; hours outside it are shaded as "not scheduled"
   // so they don't read as gaps. null/absent = around the clock.
   coverage?: Coverage | null;
+  adminEdit?: AdminEditConfig;
 }
 
-export default function ScheduleResults({ result, interactive, previewRequest, memberNames, coverage = null }: Props) {
+export default function ScheduleResults({
+  result,
+  interactive,
+  previewRequest,
+  memberNames,
+  coverage = null,
+  adminEdit,
+}: Props) {
   const [weekOffset, setWeekOffset] = useState(0);
   const [selections, setSelections] = useState<Partial<Record<SelectionSlot, RangeSelection>>>({});
   const [proposal, setProposal] = useState<ProposalState>(EMPTY_PROPOSAL);
 
   const dragRef = useRef<DragInfo | null>(null);
-  const snapMinutes = interactive?.snapMinutes ?? 15;
+  const snapMinutes = interactive?.snapMinutes ?? adminEdit?.snapMinutes ?? 15;
+
+  // Admin: reassign just the selected block(s), or the whole shift they sit in.
+  const [adminScope, setAdminScope] = useState<'block' | 'whole'>('block');
+  // The blocks picked before switching to "Whole shift", to restore on the way back.
+  const blockSelRef = useRef<RangeSelection | null>(null);
+  const [adminTo, setAdminTo] = useState('');
+  const [adminBusy, setAdminBusy] = useState(false);
+  const [adminError, setAdminError] = useState<string | null>(null);
+
+  const [conflicts, setConflicts] = useState<Record<string, ConflictStatus> | null>(null);
+  const [conflictsLoading, setConflictsLoading] = useState(false);
+  const [dragging, setDragging] = useState(false);
+
+  // Draw and select back-to-back pieces of one person's time as one block.
+  const assignments = useMemo(() => mergeContiguous(result.assignments), [result.assignments]);
 
   const memberColor = useMemo(() => {
-    const names = [...new Set(result.assignments.map((a) => a.memberName))].sort((a, b) => a.localeCompare(b));
+    const names = [...new Set(assignments.map((a) => a.memberName))].sort((a, b) => a.localeCompare(b));
     const map = new Map<string, string>();
     names.forEach((name, i) => map.set(name, getMemberColor(i)));
     return map;
-  }, [result.assignments]);
+  }, [assignments]);
 
   const { days, segmentsByDay, understaffedByDay, windowStartMin, windowEndMin } = useMemo(() => {
     const dayKeys = new Set<string>();
@@ -262,7 +303,7 @@ export default function ScheduleResults({ result, interactive, previewRequest, m
         maxMinuteOfDay = Math.max(maxMinuteOfDay, endMin);
       }
     };
-    for (const a of result.assignments) noteRange(a.start, a.end);
+    for (const a of assignments) noteRange(a.start, a.end);
     for (const u of result.understaffed) noteRange(u.start, u.end);
 
     const sortedKeys = [...dayKeys].sort();
@@ -283,7 +324,7 @@ export default function ScheduleResults({ result, interactive, previewRequest, m
 
     const segmentsByDay = new Map<string, LaidOutSegment[]>();
     const rawByDay = new Map<string, DaySegment[]>();
-    for (const a of result.assignments) {
+    for (const a of assignments) {
       const segs = splitByDay(a.start, a.end);
       for (const [key, { startMin, endMin }] of segs) {
         const list = rawByDay.get(key) ?? [];
@@ -311,13 +352,13 @@ export default function ScheduleResults({ result, interactive, previewRequest, m
     const windowEndMin = dayKeys.size > 0 ? Math.min(24 * 60, Math.ceil(maxMinuteOfDay / 60) * 60) : 24 * 60;
 
     return { days, segmentsByDay, understaffedByDay, windowStartMin, windowEndMin };
-  }, [result.assignments, result.understaffed]);
+  }, [assignments, result.understaffed]);
 
   const workload = useMemo(() => {
     const byMember = new Map<string, { minutes: number; shiftCount: number }>(
       (memberNames ?? []).map((name) => [name, { minutes: 0, shiftCount: 0 }])
     );
-    for (const a of result.assignments) {
+    for (const a of assignments) {
       const minutes = (new Date(a.end).getTime() - new Date(a.start).getTime()) / 60_000;
       const entry = byMember.get(a.memberName) ?? { minutes: 0, shiftCount: 0 };
       entry.minutes += minutes;
@@ -327,7 +368,7 @@ export default function ScheduleResults({ result, interactive, previewRequest, m
     return [...byMember.entries()]
       .map(([name, stats]) => ({ name, ...stats }))
       .sort((a, b) => b.minutes - a.minutes);
-  }, [result.assignments, memberNames]);
+  }, [assignments, memberNames]);
 
   const targetMinutes = workload.length
     ? workload.reduce((sum, w) => sum + w.minutes, 0) / workload.length
@@ -429,6 +470,12 @@ export default function ScheduleResults({ result, interactive, previewRequest, m
     anchor: string
   ) => {
     dragRef.current = { slot, memberName, assignmentStart, assignmentEnd, anchor, touchedOtherCell: false };
+    setDragging(true);
+    // A fresh pick in admin mode starts over at "Selected time".
+    if (adminEdit) {
+      setAdminScope('block');
+      blockSelRef.current = null;
+    }
     setSelections((prev) => ({
       ...prev,
       [slot]: { slot, memberName, start: anchor, end: addMinutesIso(anchor, snapMinutes) },
@@ -439,11 +486,16 @@ export default function ScheduleResults({ result, interactive, previewRequest, m
     const drag = dragRef.current;
     if (!drag) return;
     if (cellStart !== drag.anchor) drag.touchedOtherCell = true;
+    // Clamped to the shift (or gap) the drag began in, so sweeping across a
+    // neighbouring bar can't select time that isn't theirs to give.
     const lo = cellStart < drag.anchor ? cellStart : drag.anchor;
     const hiStart = cellStart < drag.anchor ? drag.anchor : cellStart;
+    const start = lo < drag.assignmentStart ? drag.assignmentStart : lo;
+    const hiEnd = addMinutesIso(hiStart, snapMinutes);
+    const end = hiEnd > drag.assignmentEnd ? drag.assignmentEnd : hiEnd;
     setSelections((prev) => ({
       ...prev,
-      [drag.slot]: { slot: drag.slot, memberName: drag.memberName, start: lo, end: addMinutesIso(hiStart, snapMinutes) },
+      [drag.slot]: { slot: drag.slot, memberName: drag.memberName, start, end },
     }));
   };
 
@@ -453,8 +505,11 @@ export default function ScheduleResults({ result, interactive, previewRequest, m
     const drag = dragRef.current;
     if (!drag) return;
     dragRef.current = null;
+    setDragging(false);
 
-    if (!drag.touchedOtherCell) {
+    // Members: a plain click proposes the whole shift. Admins: a click picks
+    // that one block (the "Whole shift" toggle covers the other case).
+    if (!drag.touchedOtherCell && !adminEdit) {
       setSelections((prev) => ({
         ...prev,
         [drag.slot]: { slot: drag.slot, memberName: drag.memberName, start: drag.assignmentStart, end: drag.assignmentEnd },
@@ -465,29 +520,108 @@ export default function ScheduleResults({ result, interactive, previewRequest, m
   const beginEdgeDrag = (slot: SelectionSlot, edge: 'start' | 'end') => {
     const sel = selections[slot];
     if (!sel) return;
-    const seg = findAssignmentFor(sel.memberName, sel.start);
+    // Bounds the resize may grow to: the shift (or understaffed gap) the
+    // selection sits in.
+    const bounds = sel.memberName === GAP_OWNER ? owningGap(sel.start) : owningShift(sel.memberName, sel.start);
     dragRef.current = {
       slot,
       memberName: sel.memberName,
-      assignmentStart: seg?.assignmentStart ?? sel.start,
-      assignmentEnd: seg?.assignmentEnd ?? sel.end,
+      assignmentStart: bounds?.start ?? sel.start,
+      assignmentEnd: bounds?.end ?? sel.end,
       anchor: edge === 'start' ? addMinutesIso(sel.end, -snapMinutes) : sel.start,
       touchedOtherCell: true, // resizing an existing selection should never "snap to full shift" on release
     };
-  };
-
-  // Full (un-clipped) bounds of the assignment a selection belongs to, for the
-  // click-expands-to-whole-shift behavior on release.
-  const findAssignmentFor = (memberName: string, atIso: string): { assignmentStart: string; assignmentEnd: string } | null => {
-    const match = result.assignments.find(
-      (a) => a.memberName === memberName && new Date(a.start) <= new Date(atIso) && new Date(a.end) >= new Date(atIso)
-    );
-    return match ? { assignmentStart: match.start, assignmentEnd: match.end } : null;
+    setDragging(true);
+    if (adminEdit) setAdminScope('block'); // a resized whole-shift selection is a custom range again
   };
 
   const resetProposal = () => {
     setSelections({});
     setProposal(EMPTY_PROPOSAL);
+    setAdminTo('');
+    setAdminError(null);
+    setAdminScope('block');
+    blockSelRef.current = null;
+  };
+
+  // The shift a selection sits in. Strict on the end (start <= t < end): with
+  // back-to-back 9-12 / 12-15 shifts, a block starting at 12:00 belongs to the
+  // second one, not the first.
+  const owningShift = (memberName: string, atIso: string) => {
+    const at = Date.parse(atIso);
+    return (
+      assignments.find(
+        (a) => a.memberName === memberName && Date.parse(a.start) <= at && at < Date.parse(a.end)
+      ) ?? null
+    );
+  };
+
+  // What's highlighted is exactly what gets handed over: "Whole shift" moves
+  // the selection itself, rather than silently changing what's submitted.
+  const fromSel = selections.from;
+  const fillingGap = fromSel?.memberName === GAP_OWNER;
+  const owningGap = (atIso: string) => {
+    const at = Date.parse(atIso);
+    const gap = result.understaffed.find((u) => Date.parse(u.start) <= at && at < Date.parse(u.end));
+    return gap ? { memberName: GAP_OWNER, start: gap.start, end: gap.end, gap } : null;
+  };
+  const selectedGap = fromSel && fillingGap ? owningGap(fromSel.start) : null;
+  const wholeShift = fromSel ? (fillingGap ? selectedGap : owningShift(fromSel.memberName, fromSel.start)) : null;
+  const handoverRange = fromSel ? { memberName: fromSel.memberName, start: fromSel.start, end: fromSel.end } : null;
+  const selectionIsWholeShift = Boolean(
+    fromSel && wholeShift && fromSel.start === wholeShift.start && fromSel.end === wholeShift.end
+  );
+
+  const chooseAdminScope = (scope: 'block' | 'whole') => {
+    if (scope === adminScope || !fromSel) return;
+    if (scope === 'whole' && wholeShift) {
+      blockSelRef.current = fromSel;
+      setSelections({ from: { ...fromSel, start: wholeShift.start, end: wholeShift.end } });
+    } else if (scope === 'block' && blockSelRef.current) {
+      setSelections({ from: blockSelRef.current });
+    }
+    setAdminScope(scope);
+  };
+
+  // Refetch who-can-cover whenever the handed-over range settles. Skipped
+  // mid-drag (the range changes every cell) and ignored if a newer range
+  // arrives before the response does.
+  const fetchConflicts = adminEdit?.fetchConflicts ?? interactive?.fetchConflicts;
+  const rangeKey = handoverRange ? `${handoverRange.start}|${handoverRange.end}` : '';
+  useEffect(() => {
+    if (!rangeKey || !fetchConflicts || dragging) {
+      setConflicts(null);
+      return;
+    }
+    const [start, end] = rangeKey.split('|');
+    let cancelled = false;
+    setConflictsLoading(true);
+    fetchConflicts(start, end)
+      .then((c) => !cancelled && setConflicts(c))
+      .catch(() => !cancelled && setConflicts(null))
+      .finally(() => !cancelled && setConflictsLoading(false));
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- fetchConflicts identity changes with parent renders
+  }, [rangeKey, result, dragging]);
+
+  const handleAdminReassign = async () => {
+    if (!adminEdit || !handoverRange || !adminTo) return;
+    setAdminBusy(true);
+    setAdminError(null);
+    try {
+      if (handoverRange.memberName === GAP_OWNER) {
+        await adminEdit.onAssign(adminTo, handoverRange.start, handoverRange.end);
+      } else {
+        await adminEdit.onReassign(handoverRange.memberName, adminTo, handoverRange.start, handoverRange.end);
+      }
+      resetProposal();
+    } catch (err) {
+      setAdminError(err instanceof Error ? err.message : 'Failed to reassign');
+    } finally {
+      setAdminBusy(false);
+    }
   };
 
   const canSubmit = Boolean(selections.from && proposal.toMember && (!proposal.includeReciprocal || selections.to));
@@ -575,7 +709,75 @@ export default function ScheduleResults({ result, interactive, previewRequest, m
             {interactive && (
               <span className="text-xs text-gray-500 italic">Click or drag one of your shifts to propose a swap</span>
             )}
+            {adminEdit && (
+              <span className="text-xs text-gray-500 italic">
+                Click a block (or drag across several) on any shift to reassign it, or on hatched understaffed time to fill it
+              </span>
+            )}
           </div>
+
+          {adminEdit && fromSel && handoverRange && (
+            <div className="space-y-2 border-b border-blue-200 bg-blue-50 px-4 py-3">
+              <div className="flex flex-wrap items-end gap-3">
+                <div>
+                  <p className="text-xs text-gray-500">
+                    {fillingGap
+                      ? `Understaffed${selectedGap ? ` (${selectedGap.gap.filled} of ${selectedGap.gap.required} on)` : ''}`
+                      : `Reassign ${fromSel.memberName}’s`}
+                  </p>
+                  <p className="text-sm font-medium text-gray-900">
+                    {formatShiftDateTime(handoverRange.start)} &ndash; {formatShiftDateTime(handoverRange.end)}
+                  </p>
+                </div>
+
+                {(!selectionIsWholeShift || adminScope === 'whole') && (
+                  <div className="flex overflow-hidden rounded-md border border-gray-300" role="radiogroup">
+                    {(['block', 'whole'] as const).map((scope) => (
+                      <button
+                        key={scope}
+                        type="button"
+                        role="radio"
+                        aria-checked={adminScope === scope}
+                        onClick={() => chooseAdminScope(scope)}
+                        className={`h-9 px-3 text-xs font-medium ${scope === 'whole' ? 'border-l border-gray-300' : ''} ${
+                          adminScope === scope ? 'bg-blue-600 text-white' : 'bg-white text-gray-700 hover:bg-gray-50'
+                        }`}
+                      >
+                        {scope === 'block' ? 'Selected time' : fillingGap ? 'Whole gap' : 'Whole shift'}
+                      </button>
+                    ))}
+                  </div>
+                )}
+
+                <div>
+                  <label className="ui-label">{fillingGap ? 'Assign' : 'Give to'}</label>
+                  <MemberPicker
+                    members={adminEdit.members.filter((n) => n !== fromSel.memberName)}
+                    value={adminTo}
+                    conflicts={conflicts}
+                    loading={conflictsLoading}
+                    onChange={setAdminTo}
+                    disabled={adminBusy}
+                  />
+                </div>
+
+                <button
+                  disabled={!adminTo || adminBusy}
+                  onClick={handleAdminReassign}
+                  className="ui-btn-primary h-9 px-4 text-sm"
+                >
+                  {adminBusy ? 'Saving...' : fillingGap ? 'Assign' : 'Reassign'}
+                </button>
+                <button onClick={resetProposal} className="ui-btn-secondary h-9 px-3 text-sm">
+                  Cancel
+                </button>
+              </div>
+              <p className="text-xs text-gray-600">
+                Applies immediately. Drag across blocks to pick a longer stretch, or drag the selection&rsquo;s edges.
+              </p>
+              {adminError && <p className="text-xs text-red-600">{adminError}</p>}
+            </div>
+          )}
 
           {interactive && selections.from && (
             <div className="space-y-2 border-b border-blue-200 bg-blue-50 px-4 py-3">
@@ -589,24 +791,16 @@ export default function ScheduleResults({ result, interactive, previewRequest, m
 
                 <div>
                   <label className="ui-label">Send to</label>
-                  <select
-                    className="ui-input h-9"
+                  <MemberPicker
+                    members={interactive.otherMembers}
                     value={proposal.toMember}
-                    onChange={(e) => {
-                      const val = e.target.value;
+                    conflicts={conflicts}
+                    loading={conflictsLoading}
+                    onChange={(val) => {
                       setProposal((p) => ({ ...p, toMember: val }));
                       setSelections((s) => ({ from: s.from }));
                     }}
-                  >
-                    <option value="" disabled>
-                      Select a member
-                    </option>
-                    {interactive.otherMembers.map((name) => (
-                      <option key={name} value={name}>
-                        {name}
-                      </option>
-                    ))}
-                  </select>
+                  />
                 </div>
 
                 <label className="flex items-center gap-2 text-xs text-gray-900 pb-2">
@@ -753,10 +947,37 @@ export default function ScheduleResults({ result, interactive, previewRequest, m
                         />
                       ))}
 
+                      {/* Admin: understaffed time is selectable like a shift. Drawn
+                          before the shift bars, so a bar inside a partly-staffed
+                          gap still gets its own clicks. */}
+                      {adminEdit &&
+                        gaps.flatMap((gap) => {
+                          const cells: number[] = [];
+                          for (let m = gap.startMin; m < gap.endMin; m += snapMinutes) cells.push(m);
+                          return cells.map((m) => {
+                            const start = cellTime(day.date, m);
+                            return (
+                              <div
+                                key={`gapcell-${gap.range.start}-${m}`}
+                                title={`Understaffed: ${gap.range.filled}/${gap.range.required} — click to assign someone`}
+                                onMouseDown={(e) => {
+                                  e.preventDefault();
+                                  beginCellDrag('from', GAP_OWNER, gap.range.start, gap.range.end, start);
+                                }}
+                                onMouseEnter={() => extendCellDrag(start)}
+                                className="absolute left-0 right-0 cursor-crosshair hover:bg-red-500/10"
+                                style={{ top: `${pctTop(m)}%`, height: `${pctHeight(m, m + snapMinutes)}%` }}
+                              />
+                            );
+                          });
+                        })}
+
                       {segs.map((seg) => {
                         const color = memberColor.get(seg.memberName) ?? getMemberColor(0);
                         const widthPct = 100 / seg.colCount;
-                        const fromDraggable = Boolean(interactive && seg.memberName === interactive.viewerName);
+                        const fromDraggable = Boolean(
+                          adminEdit || (interactive && seg.memberName === interactive.viewerName)
+                        );
                         const toDraggable = Boolean(
                           interactive && proposal.includeReciprocal && proposal.toMember && seg.memberName === proposal.toMember
                         );
